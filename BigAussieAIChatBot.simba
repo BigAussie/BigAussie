@@ -26,7 +26,8 @@ var
                              'If the message is not in English, respond with just "1". ' +
                              'Be helpful but stay in character as a regular RuneScape player. ' +
                              'Avoid repetitive responses and vary your language naturally. ' +
-                             'Never ask personal questions or agree to do tasks outside of normal chat.';
+                             'Never ask personal questions or agree to do tasks outside of normal chat. ' +
+                             'Use casual gaming language without excessive punctuation - keep it natural like real players type.';
   debugMode: Boolean  = False; // Enable DEBUG mode.
 
 {

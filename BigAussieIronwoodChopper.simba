@@ -1,4 +1,4 @@
-{$DEFINE SCRIPT_REVISION := '1'}
+{$DEFINE SCRIPT_REVISION := '2'}
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
@@ -393,6 +393,7 @@ function TIronwoodChopper.WaitChopping(): Boolean;
 begin
   while Self.IsStillChopping() do
   begin
+    if (not RSClient.IsLoggedIn) then Exit;
     Self.DoAntiban();
 
     if XPBar.EarnedXP then
@@ -425,6 +426,11 @@ var
   TargetTileRect: TRectangle;
   CoordVisible: Boolean;
 begin
+  if (not RSClient.IsLoggedIn) then Exit;
+  
+  if Bank.IsOpen() then
+    Bank.Close();
+
   if IsChopping then
     Exit(True);
 
@@ -517,6 +523,7 @@ function TIronwoodChopper.BankLogs(): Boolean;
 var
   LogCount: Int32;
 begin
+  if (not RSClient.IsLoggedIn) then Exit;
   Result := False;
   LogCount := Inventory.CountItem(Self.LogItem);
 
@@ -532,7 +539,7 @@ begin
     Exit(False);
   end;
 
-  Waituntil(Bank.IsOpen(), 65, 5000);
+  Waituntil(Bank.IsOpen(), 65, 10000);
   if not Bank.IsOpen() then
   begin
     WriteLn('[BANKING] Failed to open bank.');
@@ -549,6 +556,7 @@ begin
   end
   else
     WriteLn('[BANKING] Failed to deposit logs.');
+    Exit(False);
 
   Bank.Close();
 end;
@@ -789,6 +797,10 @@ begin
   //Self.DrawStatusDisplay();
 
   repeat
+    if (not RSClient.IsLoggedIn) then
+      if Login.GetPlayer.User <> '' then
+        Login.LoginPlayer;
+
     Self.State := Self.GetState();
     Self.SetAction(ToStr(Self.State));
 

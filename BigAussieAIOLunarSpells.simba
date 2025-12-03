@@ -6,6 +6,59 @@
 {$I WaspLib/optional/handlers/teleports/transport.simba}
 {$I WaspLib/optional/handlers/birdhouserunner.simba}
 
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+// ADD SUPPORT FOR SAWMILL VOUCHERS
+{
+Entropy — 20/08/2025 13:01
+@BigAussie when the script is manually casting, it cycles through the logs from the first one in the inventory through to the last one, this is not ideal.
+
+It should work similar to alching, where it can essentially spam click the same position for the plank make spell and log 19 times before having to then let it autocast the remaining few or manually clicking those.
+
+If pressing the 19th log, over and over it'll still make the plank from the 1st, 2nd etc. logs each time.}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // =NOTE=
 // Ensure the item you want to process is at the top of your inventory.
 // If you wish to use the Rune Pouch you MUST start with it in your inventory.
@@ -418,6 +471,12 @@ begin
   Items[40].AssociatedItems := ['Teak logs', 'Teak plank', 'noted Teak plank', 'Astral rune', 'Nature rune', 'Coins'];
   Items[41].Name := 'Mahogany Logs';
   Items[41].AssociatedItems := ['Mahogany logs', 'Mahogany plank', 'noted Mahogany plank', 'Astral rune', 'Nature rune', 'Coins'];
+  Items[46].Name := 'Ironwood Logs';
+  Items[46].AssociatedItems := ['Ironwood logs', 'Ironwood plank', 'noted Ironwood plank', 'Astral rune', 'Nature rune', 'Coins'];
+  Items[47].Name := 'Camphor Logs';
+  Items[47].AssociatedItems := ['Camphor logs', 'Camphor plank', 'noted Camphor plank', 'Astral rune', 'Nature rune', 'Coins'];
+  Items[48].Name := 'Rosewood Logs';
+  Items[48].AssociatedItems := ['Rosewood logs', 'Rosewood plank', 'noted Rosewood plank', 'Astral rune', 'Nature rune', 'Coins'];
   Items[42].Name := 'Amulet of Glory';
   Items[42].AssociatedItems := ['Amulet of glory', 'Amulet of glory(4)', 'noted Amulet of glory(4)', 'Astral rune', 'Soul rune'];
   Items[43].Name := 'Combat Bracelet';
@@ -1477,6 +1536,9 @@ begin
     'Oak logs': CoinsCount := ceil(RawItemCount * 172 / 1000) * 1000;
     'Teak logs': CoinsCount := ceil(RawItemCount * 350 / 1000) * 1000;
     'Mahogany logs': CoinsCount := ceil(RawItemCount * 1050 / 1000) * 1000;
+    'Ironwood logs': CoinsCount := ceil(RawItemCount * 3500 / 1000) * 1000;
+    'Camphor logs': CoinsCount := ceil(RawItemCount * 1750 / 1000) * 1000;
+    'Rosewood logs': CoinsCount := ceil(RawItemCount * 5250 / 1000) * 1000;
     end;
     if BANKFILLERSCHECK then
       CoinsBank := TRSBankItem.Setup(CoinsItem, bank.QUANTITY_ALL, False)
@@ -1947,6 +2009,9 @@ begin
     'Oak logs': CoinCostPerCast := 175;
     'Teak logs': CoinCostPerCast := 350;
     'Mahogany logs': CoinCostPerCast := 1050;
+    'Ironwood logs': CoinCostPerCast := 3500;
+    'Camphor logs': CoinCostPerCast := 1750;
+    'Rosewood logs': CoinCostPerCast := 5250;
   end;
   case ChosenSpell of
     BAKE_PIE: Result := RawTotal * (ProcessedItemValue - RawItemValue - RuneValue);
@@ -2349,6 +2414,9 @@ begin
     Self.ItemSelector.AddItem('Oak Logs', nil);
     Self.ItemSelector.AddItem('Teak Logs', nil);
     Self.ItemSelector.AddItem('Mahogany Logs', nil);
+    Self.ItemSelector.AddItem('Camphor Logs', nil);
+    Self.ItemSelector.AddItem('Ironwood Logs', nil);
+    Self.ItemSelector.AddItem('Rosewood Logs', nil);
   end
   else if selectedSpell = 'Recharge Dragonstone' then
   begin

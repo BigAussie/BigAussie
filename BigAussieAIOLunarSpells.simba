@@ -1,63 +1,10 @@
 {$DEFINE SCRIPT_ID := '0757baf6-64b1-4889-9c51-7bc460e1efc6'} 
-{$DEFINE SCRIPT_REVISION := '41'}  
+{$DEFINE SCRIPT_REVISION := '42'}  
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
 {$I WaspLib/optional/handlers/teleports/transport.simba}
 {$I WaspLib/optional/handlers/birdhouserunner.simba}
-
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-// ADD SUPPORT FOR SAWMILL VOUCHERS
-{
-Entropy — 20/08/2025 13:01
-@BigAussie when the script is manually casting, it cycles through the logs from the first one in the inventory through to the last one, this is not ideal.
-
-It should work similar to alching, where it can essentially spam click the same position for the plank make spell and log 19 times before having to then let it autocast the remaining few or manually clicking those.
-
-If pressing the 19th log, over and over it'll still make the plank from the 1st, 2nd etc. logs each time.}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 // =NOTE=
 // Ensure the item you want to process is at the top of your inventory.
@@ -189,6 +136,7 @@ var
   CoinsChecked: Boolean;
   HasRunePouch: Boolean;
   HasDivineRunePouch: Boolean;
+  HasSawmillVoucher: Boolean;
 
   Script: AIOLunarSpells;
 
@@ -505,6 +453,7 @@ begin
   end;
   
   HasRunePouch := False;
+  HasSawmillVoucher := False;
   RunePouch := ('Rune pouch');
   DivineRunePouch := ('Divine Rune Pouch');
 
@@ -588,7 +537,7 @@ begin
     Wait(250);
   end;
   SwitchFocusState();
-  FocusState := fsFocused;
+ // FocusState := fsFocused;
   StartXP := XPBar.Read();
   CastCount := 0;
   CoinsCount := 0;
@@ -618,6 +567,13 @@ begin
       WriteLn('Rune buying is not supported with Rune Pouch - Disabling buying runes.');
     end;
   end;
+
+  if (CHOSENSPELL = PLANK_MAKE) and Inventory.ContainsItem('Sawmill voucher') then
+  begin
+    HasSawmillVoucher := True;
+    WriteLn('Sawmill Voucher Found. Each Plank Make cast will create an extra plank.');
+  end;
+  writeln('has sawmill voucher: ', HasSawmillVoucher);
   Bank.WalkOpen();
   WaitUntil(Bank.IsOpen(), 65, 2150);
 end;
@@ -1446,25 +1402,56 @@ end;
 
 procedure AIOLunarSpells.FastCastingStandardOrder(RawItemCount: Integer; ScriptSpeed: ScriptSpeedTypes; RawItem: String; waitTimeCasting: Integer);
 var
-failCount: Integer;
+  fixedSlot: Int32;
+  slots: TIntegerArray;
+  ClickCount: Int32;
+  RawItemTRS: TRSItem;
 begin
   MainScreen.CloseInterface(True);
   WaitUntil(not Bank.IsOpen(), 65, 2100); 
   WriteLn('Fast casting standard order.');
   
-  failCount := 0;
+  fixedSlot := -1;
+  RawItemTRS := RawItem;
+  
+  if Inventory.FindItem(RawItemTRS, slots) and (Length(slots) > 0) then
+  begin
+    if 27 in slots then
+      fixedSlot := 27
+    else if 19 in slots then
+      fixedSlot := 19
+    else
+      fixedSlot := slots[High(slots)];
+    WriteLn('Using fixed slot ' + IntToStr(fixedSlot) + ' for spam clicking.');
+  end;
   
   while RawItemCount > 0 do
   begin
-    CastSpell();
-    WaitUntil(Inventory.IsOpen(), 35, 1250);
-    RawItemCount := Inventory.CountItem(RawItem);
-    self.ClickItem(RawItem, '>');
-    if RawItemCount = 1 then
-      break;
-    Wait(waitTimeCasting);
-      
-    WaitUntil(Magic.IsOpen(), 35, 2000);
+    if (RawItemCount >= 19) and (fixedSlot <> -1) then
+    begin
+      ClickCount := 0;
+      while (ClickCount < 19) and (RawItemCount > 1) do
+      begin
+        CastSpell();
+        WaitUntil(Inventory.IsOpen(), 35, 1250);
+        self.ClickSlot(fixedSlot, '>');
+        RawItemCount := Inventory.CountItem(RawItem);
+        Wait(waitTimeCasting);
+        WaitUntil(Magic.IsOpen(), 35, 2000);
+        Inc(ClickCount);
+      end;
+    end
+    else
+    begin 
+      CastSpell();
+      WaitUntil(Inventory.IsOpen(), 35, 1250);
+      RawItemCount := Inventory.CountItem(RawItem);
+      self.ClickItem(RawItemTRS, '>');
+      if RawItemCount <= 1 then
+        break;
+      Wait(waitTimeCasting);
+      WaitUntil(Magic.IsOpen(), 35, 2000);
+    end;
   end;
 end;
 
@@ -1520,11 +1507,13 @@ var
   RawItemCount: Int32;
   CurrentCastingOrder: CastingOrder;
   FocusJustSwitched: boolean;
+  LocalRawItemBank: TRSBankItem;
 begin
   RawItemToBuy := 0;
   AstralRunesToBuy := 0;
   Array5QuantityToBuy := 0;
   OpenBankDepositItem(ProcessedItemBank);
+
   if not CoinsChecked then
   begin
     WriteLn('Counting ' + RawItem);
@@ -1540,12 +1529,14 @@ begin
     'Camphor logs': CoinsCount := ceil(RawItemCount * 1750 / 1000) * 1000;
     'Rosewood logs': CoinsCount := ceil(RawItemCount * 5250 / 1000) * 1000;
     end;
+
     if BANKFILLERSCHECK then
       CoinsBank := TRSBankItem.Setup(CoinsItem, bank.QUANTITY_ALL, False)
     else
       CoinsBank := TRSBankItem.Setup(CoinsItem, CoinsCount, False); 
     WriteLn('Coins needed: ' + IntToStr(CoinsCount));
   end;
+
   if not CoinsChecked and (Inventory.CountItem('Coins') < CoinsCount) and (Inventory.CountItem('Coins') = 0) then
   begin
     Bank.WithdrawItem(CoinsBank, True);
@@ -1557,8 +1548,10 @@ begin
     end;
     CoinsChecked := True;
   end;
+  
   WithdrawAstralRunes();
   Withdraw5Array();
+  
   EmptySlots := Inventory.CountEmptySlots();
   while EmptySlots <= 0 do
   begin
@@ -1566,9 +1559,34 @@ begin
     OpenBankDepositItem(ProcessedItemBank);
     EmptySlots := Inventory.CountEmptySlots();
   end;
-  ProcessedItemBank := TRSBankItem.Setup(ProcessedItem, EmptySlots, FALSE);
-  RawItemBank := TRSBankItem.Setup(RawItem, EmptySlots, FALSE);
-  WithdrawRawItem(RawItem, RawItemBank, QuantityInput, BUYRAWMATERIALS);
+  
+  if not Bank.IsOpen() then
+    Bank.Open();
+  
+  if Inventory.ContainsItem('Sawmill voucher') then
+  begin
+    HasSawmillVoucher := True;
+    Bank.CachedQuantity := 0;
+    WriteLn('Sawmill Voucher found.');
+  end
+  else
+  begin
+    HasSawmillVoucher := False;
+  end;
+  
+  QuantityInput := Inventory.CountEmptySlots();
+
+  if HasSawmillVoucher then
+  begin
+    LocalRawItemBank := TRSBankItem.Setup(RawItem, QuantityInput div 2, FALSE);
+  end
+  else
+  begin
+    LocalRawItemBank := TRSBankItem.Setup(RawItem, QuantityInput, FALSE);
+  end;
+  writeln('quantity input: ', QuantityInput);
+  WithdrawRawItem(RawItem, LocalRawItemBank, QuantityInput, BUYRAWMATERIALS);
+
   if (RawItemToBuy > 0) or (AstralRunesToBuy > 0) or (Array5QuantityToBuy > 0) then
   begin
     SellFinishedItem();
@@ -1585,9 +1603,11 @@ begin
     CheckInventoryLogoutIfEmpty(ItemArray5);
     CheckInventoryLogoutIfEmpty(AstralRune);
   end;
+
   RawItemCount := Inventory.CountItem(RawItem);
   RawTotal += RawItemCount;
-  Wait(RandomRange(60, 80)); // Small wait to count invent
+  Wait(RandomRange(60, 80));
+
   if GetTimeRunning() > FocusTimer then
     SwitchFocusState();
 
@@ -1601,11 +1621,25 @@ begin
     SlowAFKCasting(RawItem, ScriptSpeed);
     FocusJustSwitched := True;
   end;
-  CastCount += Inventory.CountItem(ProcessedItem);
-  TotalActions += Inventory.CountItem(ProcessedItem);
+
+  if HasSawmillVoucher and not Inventory.ContainsItem('Sawmill voucher') then
+    HasSawmillVoucher := False;
+
+  if HasSawmillVoucher and Inventory.ContainsItem('Sawmill voucher') then
+  begin
+    CastCount += Inventory.CountItem(ProcessedItem) div 2;
+    TotalActions += Inventory.CountItem(ProcessedItem) div 2;
+  end
+  else
+  begin
+    CastCount += Inventory.CountItem(ProcessedItem);
+    TotalActions += Inventory.CountItem(ProcessedItem);
+  end;
   CheckBreakSleepLevel();
+
   if not MainScreen.HasInterface() then
     Self.Report();
+
   bank.Hover();
   Wait(RandomRange(600, 700));
 end;
@@ -1633,6 +1667,7 @@ begin
     SUPERGLASS_MAKE, RECHARGE_DRAGONSTONE: doSuperGlassAndRechargeDragonstone();
     PLANK_MAKE: doPlankMake();
   end;
+
   CheckBreakSleepLevel();
   Self.DoAntiban();
   If SRL.dice(1) then // Thanks Student for his help with this code.
@@ -2019,7 +2054,13 @@ begin
     SPIN_FLAX: Result := RawTotal * (ProcessedItemValue - RawItemValue) - (RuneValue - 2 * ItemArray5Value);
     TAN_LEATHER: Result := RawTotal * (ProcessedItemValue - RawItemValue) - (2 * RuneValue - ItemArray5Value);
     STRING_JEWELLERY: Result := RawTotal * (ProcessedItemValue - RawItemValue) - 2 * RuneValue; // Untested but updated.
-    PLANK_MAKE: Result := RawTotal * (ProcessedItemValue - RawItemValue - 2 * RuneValue - ItemArray5Value - CoinCostPerCast);
+    PLANK_MAKE: 
+    begin
+      if HasSawmillVoucher then
+        Result := RawTotal * (2 * ProcessedItemValue - RawItemValue - 2 * RuneValue - ItemArray5Value - CoinCostPerCast)
+      else
+        Result := RawTotal * (ProcessedItemValue - RawItemValue - 2 * RuneValue - ItemArray5Value - CoinCostPerCast);
+    end;
     RECHARGE_DRAGONSTONE: Result := RawTotal * (ProcessedItemValue - RawItemValue - RuneValue - ItemArray5Value);
     SUPERGLASS_MAKE:
     begin

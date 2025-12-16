@@ -1,0 +1,2165 @@
+{$DEFINE SCRIPT_REVISION := '1'}
+{$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
+{$I SRL-T/osr.simba}
+{$I WaspLib/osr.simba}
+{$I WaspLib/optional/handlers/discord.simba}
+
+const
+  TRAP_CRAB_CAUGHT_BUFFER = 2000;
+
+type
+  ECrabTrapState = (
+    BAIT_TRAPS,
+    WAIT_FOR_CRABS,
+    EMPTY_TRAPS,
+    MANAGE_INVENTORY,
+    END_SCRIPT
+  );
+  
+  EInventoryManagement = (
+    USE_PESTLE_AND_MORTAR,
+    USE_KNIFE,
+    DROP_CRABS
+  );
+  
+  ECrabType = (
+    RED_CRAB,
+    BLUE_CRAB,
+    RAINBOW_CRAB
+  );
+  
+  TTrapInfo = record
+    Location: TPoint;
+    IsBaited: Boolean;
+    HasCrab: Boolean;
+    CrabType: ECrabType;
+    BaitTime: UInt64;
+  end;
+
+  TCrabTrapper = record(TBaseScript)
+    State: ECrabTrapState;
+
+    NextWorldHopTime: UInt64;
+    WorldHopsCompleted: Int32;
+    LastWorldHopTime: Int64;
+    LastImageClear: UInt64;
+    
+    TrapCount: Int32;
+    Traps: array of TTrapInfo;
+    HunterLevel: Int32;
+    TargetCrabType: ECrabType;
+    
+    StartXP: Int32;
+    LastXP: Int32;
+    HunterXP: Int32;
+    CookingXP: Int32;
+    LastXPReadTime: UInt64;
+    LastReportTime: UInt64;
+    LastHourlyReportTime: Int64;
+    
+    LastEmptiedTrapIndex: Int32;
+    
+    LastBaitCount: Int32;
+    
+    RedCrabTraps: array[0..4] of TRSObjectV2;
+    BlueCrabTrapsNorth: array[0..4] of TRSObjectV2;
+    BlueCrabTrapsEast: array[0..4] of TRSObjectV2;
+    RainbowCrabTraps: array[0..4] of TRSObjectV2;
+    
+    RedCrabStove: TRSObjectV2;
+    RainbowCrabStove: TRSObjectV2;
+    
+    RedCrabBankChest: TRSObjectV2;
+  end;
+
+var
+  WEBHOOKURL: String                     = '';
+  ENABLEWEBHOOKS: Boolean                = True;
+  SENDSESSIONSUMMARYMSG: Boolean         = True;
+  SENDHOURLYREPORTMSG: Boolean           = True;
+  PINGONTERMINATED: Boolean              = True;
+
+  ENABLEWORLDHOPPING: Boolean = False;
+  WORLDHOPINTERVAL: Integer = 45;
+  SELECTEDCRABTYPE: ECrabType = ECrabType.RED_CRAB;
+  USE_BANK_FOR_RED_CRABS: Boolean = False;
+  TRAP_COUNT_MODE: Integer = 0;
+  
+  UNSET_TRAP_COLOR: TCTS2Color;
+  TRAP_BAIT_COLOR: TCTS2Color;
+
+  Discord: TDiscordClient;
+  
+procedure TAntiban.RandomChatTask(); override;
+begin
+  Exit;
+end;
+
+procedure TAntiban.Setup(); override;
+begin
+  Self.Skills := [ERSSkill.HUNTER, ERSSkill.TOTAL];
+  Self.MinZoom := 15;
+  Self.MaxZoom := 60;
+
+  inherited;
+end;
+
+function FormatRoundedNumber(Number: Integer): String;
+begin
+  if Number >= 1000000 then
+    Result := FormatFloat('0.0M', Number / 1000000)
+  else if Number >= 1000 then
+    Result := FormatFloat('0K', Number / 1000)
+  else
+    Result := SRL.FormatNumber(Number);
+end;
+
+function TCrabTrapper.SafeReadXPBar(): Integer;
+var
+  XPValue: Integer;
+  AttemptCount: Int32;
+  ValidReading: Boolean;
+  PreviousValidXP: Integer;
+  XPDifference: Integer;
+  TimeSinceLastRead: UInt64;
+  MaxPossibleGain: Integer;
+begin
+  if (not RSClient.IsLoggedIn) then
+    Exit(Self.LastXP);
+
+  if RSInterface.IsOpen() then
+    RSInterface.Close();
+
+  Result := Self.LastXP;
+  ValidReading := False;
+  AttemptCount := 0;
+
+  if Self.LastXP > 0 then
+    PreviousValidXP := Self.LastXP
+  else
+    PreviousValidXP := Self.StartXP;
+
+  while (not ValidReading) and (AttemptCount < 5) do
+  begin
+    Inc(AttemptCount);
+
+    if not XPBar.IsOpen() then
+    begin
+      XPBar.Open();
+      Wait(500 + Random(500));
+    end;
+
+    XPValue := XPBar.Read();
+
+    if (XPValue > 0) and (XPValue >= 10000) and (PreviousValidXP > 0) then
+    begin
+      XPDifference := XPValue - PreviousValidXP;
+      TimeSinceLastRead := GetTickCount() - Self.LastXPReadTime;
+
+      MaxPossibleGain := Round((TimeSinceLastRead / 1000.0) * 100);
+      if MaxPossibleGain < 1000 then MaxPossibleGain := 1000;
+
+      if (XPDifference <= MaxPossibleGain) and (XPDifference >= -1000) then
+      begin
+        ValidReading := True;
+        Result := XPValue;
+      end;
+    end
+    else
+    begin
+      ValidReading := True;
+      Result := XPValue;
+    end;
+
+    if not ValidReading then
+    begin
+      if AttemptCount < 3 then
+      begin
+        Wait(500 + Random(1000));
+      end
+      else
+      begin
+        Wait(1000 + Random(2000));
+      end;
+    end;
+  end;
+
+end;
+
+procedure TCrabTrapper.ReadAndTrackXP(IsHunter: Boolean);
+var
+  CurrentXP, XPGained: Integer;
+  SkillName: String;
+begin
+  CurrentXP := Self.SafeReadXPBar();
+  
+  if (Self.LastXP > 0) and (CurrentXP > Self.LastXP) then
+  begin
+    XPGained := CurrentXP - Self.LastXP;
+    if IsHunter then
+    begin
+      Self.HunterXP := Self.HunterXP + XPGained;
+      SkillName := 'Hunter';
+    end
+    else
+    begin
+      Self.CookingXP := Self.CookingXP + XPGained;
+      SkillName := 'Cooking';
+    end;
+  end;
+  
+  if CurrentXP > 0 then
+  begin
+    Self.LastXP := CurrentXP;
+    Self.LastXPReadTime := GetTickCount();
+  end;
+end;
+
+function TCrabTrapper.GetTrapCountFromLevel(Level: Int32): Int32;
+begin
+  if Level < 20 then Result := 1
+  else if Level < 40 then Result := 2
+  else if Level < 60 then Result := 3
+  else if Level < 80 then Result := 4
+  else Result := 5;
+end;
+
+function TCrabTrapper.GetCrabWaitTicks(CrabType: ECrabType): Int32;
+begin
+  case CrabType of
+    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB: Result := 15;
+    ECrabType.RAINBOW_CRAB: Result := 25;
+    else Result := 15;
+  end;
+end;
+
+function TCrabTrapper.WaitForXPGain(StartXP: Int32; TimeoutMS: Int32): Boolean;
+var
+  CurrentXP: Int32;
+  StartTime: UInt64;
+begin
+  StartTime := GetTickCount();
+  Result := False;
+  
+  while (GetTickCount() - StartTime < TimeoutMS) do
+  begin
+    CurrentXP := Self.SafeReadXPBar();
+    if CurrentXP > StartXP then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Wait(100, 200);
+  end;
+end;
+
+function TCrabTrapper.WaitForBaitDecrease(BaitItem: String; TargetCount: Int32): Boolean;
+var
+  CurrentCount: Int32;
+begin
+  CurrentCount := Inventory.CountItemStack(BaitItem);
+  
+  if CurrentCount > TargetCount then
+  begin
+    if not WaitUntil(Inventory.CountItemStack(BaitItem) = TargetCount, 65, 5000) then
+      Exit(False);
+  end;
+  
+  Self.LastBaitCount := Inventory.CountItemStack(BaitItem);
+  Result := True;
+end;
+
+procedure TCrabTrapper.SetupChunksForCrabType(CrabType: ECrabType);
+begin
+  case CrabType of
+    ECrabType.RED_CRAB:
+    begin
+      Map.SetupChunkEx([46, 47, 48, 45], [0]);
+      WriteLn('[INIT] Loaded chunks for Red Crabs: 46, 47, 48, 45');
+    end;
+    ECrabType.BLUE_CRAB:
+    begin
+      Map.SetupChunkEx([47, 40, 52, 35], [0]);
+      WriteLn('[INIT] Loaded chunks for Blue Crabs: 47, 40, 52, 35');
+    end;
+    ECrabType.RAINBOW_CRAB:
+    begin
+      Map.SetupChunkEx([26, 42, 28, 40], [0]);
+      WriteLn('[INIT] Loaded chunks for Rainbow Crabs: 26, 42, 28, 40');
+    end;
+  end;
+end;
+
+procedure TCrabTrapper.SetupObjects();
+var
+  I: Int32;
+  RedCrabCoords, BlueCrabNorthCoords, BlueCrabEastCoords, RainbowCrabCoords: TPointArray;
+begin
+  UNSET_TRAP_COLOR := CTS2(6456985, 6, 0.09, 1.04);
+
+  if Self.TargetCrabType = ECrabType.RAINBOW_CRAB then
+    TRAP_BAIT_COLOR := CTS2(8631689, 12, 0.79, 0.82)
+  else
+    TRAP_BAIT_COLOR := CTS2(11250869, 17, 0.11, 0.16);
+  
+  RedCrabCoords := [
+    [8052, 38550],
+    [8048, 38542],
+    [8052, 38534],
+    [8044, 38530],
+    [8035, 38516]
+  ];
+
+  BlueCrabNorthCoords := [[8760, 40382], [8752, 40382], [8743, 40373], [8756, 40364], [8768, 40373]];
+  BlueCrabEastCoords := [[8904, 40710], [8904, 40702], [8908, 40688], [8916, 40697], [8916, 40706]];
+  RainbowCrabCoords := [[2940, 39790], [2932, 39786], [2928, 39778], [2932, 39768], [2940, 39765]];
+  
+  for I := 0 to 4 do
+  begin
+    with Self.RedCrabTraps[I] do
+    begin
+      Walker := @Map.Walker;
+      Finder.Colors := [UNSET_TRAP_COLOR];
+      SetupEx([1, 1, 2], [[RedCrabCoords[I].X, RedCrabCoords[I].Y]]);
+      SetupUpText(['(empty)', '(full)']);
+    end;
+    with Self.BlueCrabTrapsNorth[I] do
+    begin
+      Walker := @Map.Walker;
+      Finder.Colors := [UNSET_TRAP_COLOR];
+      SetupEx([1, 1, 2], [[BlueCrabNorthCoords[I].X, BlueCrabNorthCoords[I].Y]]);
+      SetupUpText(['(empty)', '(full)']);
+    end;
+    with Self.BlueCrabTrapsEast[I] do
+    begin
+      Walker := @Map.Walker;
+      Finder.Colors := [UNSET_TRAP_COLOR];
+      SetupEx([1, 1, 2], [[BlueCrabEastCoords[I].X, BlueCrabEastCoords[I].Y]]);
+      SetupUpText(['(empty)', '(full)']);
+    end;
+    with Self.RainbowCrabTraps[I] do
+    begin
+      Walker := @Map.Walker;
+      Finder.Colors := [UNSET_TRAP_COLOR];
+      SetupEx([1, 1, 2], [[RainbowCrabCoords[I].X, RainbowCrabCoords[I].Y]]);
+      SetupUpText(['(empty)', '(full)']);
+    end;
+  end;
+  
+  with Self.RedCrabStove do
+  begin
+    Walker := @Map.Walker;
+    SetupEx([2, 2, 2], [[8030, 38500]]);
+    SetupUpText(['Cooking']);
+    Finder.Colors += CTS2(7705748, 22, 0.77, 0.46);
+  end;
+  
+  with Self.RainbowCrabStove do
+  begin
+    Walker := @Map.Walker;
+    SetupEx([0.8, 1, 2], [[2994, 39819]]);
+    SetupUpText(['Cook']);
+    Finder.Colors += CTS2(3420928, 2, 0.17, 0.01);
+  end;
+  
+  with Self.RedCrabBankChest do
+  begin
+    Walker := @Map.Walker;
+    SetupEx([1.8, 1.8, 3], [[8060, 38428]]);
+    SetupUpText(['Bank']);
+    Finder.Colors += CTS2(3696259, 6, 0.05, 0.27);
+  end;
+end;
+
+procedure TCrabTrapper.SendTerminationNotification();
+begin
+  writeln('Script has terminated, sending session summary');
+  Self.SendSessionSummary();
+end;
+
+procedure TCrabTrapper.Init(MaxActions: UInt32; MaxTime: UInt64); override;
+var
+  I: Int32;
+  TrapLocations: TPointArray;
+begin
+  inherited;
+  
+  Self.TargetCrabType := SELECTEDCRABTYPE;
+  
+  Self.SetupChunksForCrabType(Self.TargetCrabType);
+  
+  Self.SetupObjects();
+  Objects.Setup(Map.Objects(), @Map.Walker);
+  
+  Self.HunterLevel := Stats.GetLevel(ERSSkill.HUNTER);
+  
+  if TRAP_COUNT_MODE = 0 then
+    Self.TrapCount := Self.GetTrapCountFromLevel(Self.HunterLevel)
+  else
+    Self.TrapCount := TRAP_COUNT_MODE;
+  
+  WriteLn('[INIT] Hunter Level: ', Self.HunterLevel, ', Trap Count: ', Self.TrapCount, ', Target: ', ToStr(Self.TargetCrabType));
+  
+  Self.StartXP := Self.SafeReadXPBar();
+  Self.LastXP := Self.StartXP;
+  Self.HunterXP := 0;
+  Self.CookingXP := 0;
+  Self.LastXPReadTime := GetTickCount();
+  Self.LastReportTime := 0;
+  Self.LastHourlyReportTime := 0;
+  WriteLn('[INIT] Starting XP: ' + ToStr(Self.StartXP));
+  
+  if SENDSESSIONSUMMARYMSG and ENABLEWEBHOOKS then
+    AddOnTerminate(@Self.SendTerminationNotification);
+  
+  Self.LastEmptiedTrapIndex := -1;
+  
+  Self.LastBaitCount := Inventory.CountItemStack(Self.GetBaitItemName());
+  WriteLn('[INIT] Initial bait count: ' + ToStr(Self.LastBaitCount));
+  
+  TrapLocations := Self.FindAllTrapLocations(Self.TargetCrabType, Self.TrapCount);
+  
+  if Length(TrapLocations) = 0 then
+  begin
+    WriteLn('[ERROR] No trap locations found!');
+    TerminateScript();
+    Exit;
+  end;
+  
+  if Length(TrapLocations) < Self.TrapCount then
+    Self.TrapCount := Length(TrapLocations);
+  
+  SetLength(Self.Traps, Self.TrapCount);
+  
+  for I := 0 to High(Self.Traps) do
+  begin
+    Self.Traps[I].Location := TrapLocations[I];
+    Self.Traps[I].CrabType := Self.TargetCrabType;
+    Self.Traps[I].IsBaited := False;
+    Self.Traps[I].HasCrab := False;
+  end;
+  
+  Self.SetupWorldHopping();
+end;
+
+function TCrabTrapper.GetRandomWorldHopTime(): UInt64;
+var
+  BaseInterval: UInt64;
+begin
+  BaseInterval := WORLDHOPINTERVAL * 60000;
+  Result := BaseInterval + Round(BaseInterval * (Random(-10, 10) / 100.0));
+end;
+
+procedure TCrabTrapper.SetupWorldHopping();
+begin
+  if not ENABLEWORLDHOPPING then
+    Exit;
+  
+  if Length(Login.GetPlayer().Worlds) < 2 then
+  begin
+    WriteLn('[ERROR] Need at least 2 worlds configured for world hopping!');
+    Logout.ClickLogout();
+    TerminateScript();
+  end;
+  
+  Self.NextWorldHopTime := GetTickCount() + Self.GetRandomWorldHopTime();
+end;
+
+function TCrabTrapper.ShouldHopWorld(): Boolean;
+begin
+  if not ENABLEWORLDHOPPING then
+    Exit(False);
+  
+  if GetTickCount() < Self.NextWorldHopTime then
+    Exit(False);
+  
+  Result := True;
+end;
+
+procedure TCrabTrapper.DoWorldHop();
+var
+  currentWorld: Int32;
+  playerWorlds: TIntegerArray;
+  targetWorld: Int32;
+  availableWorlds: TIntegerArray;
+  i: Int32;
+begin
+  if not ENABLEWORLDHOPPING then
+    Exit;
+  
+  WriteLn('[WORLDHOP] Time to hop worlds!');
+  
+  playerWorlds := Login.GetPlayer().Worlds;
+  
+  if not Logout.Open() then
+  begin
+    Self.NextWorldHopTime := GetTickCount() + 120000;
+    Exit;
+  end;
+  
+  if not Logout.IsWorldSwitcherOpen() then
+    Logout.GetButton(ERSLogoutButton.WORLD_SWITCHER).Click(MOUSE_LEFT);
+  WaitUntil((currentWorld := WorldHopper.GetCurrentWorld()) <> 0, 65, 20000);
+  
+  availableWorlds := [];
+  for i := 0 to High(playerWorlds) do
+  begin
+    if playerWorlds[i] <> currentWorld then
+      availableWorlds += playerWorlds[i];
+  end;
+  
+  if Length(availableWorlds) = 0 then
+  begin
+    ENABLEWORLDHOPPING := False;
+    Exit;
+  end;
+  
+  targetWorld := availableWorlds[Random(Length(availableWorlds))];
+  
+  if WorldHopper.Hop([targetWorld]) then
+  begin
+    Inc(Self.WorldHopsCompleted);
+    Self.LastWorldHopTime := GetTickCount();
+    Self.NextWorldHopTime := GetTickCount() + Self.GetRandomWorldHopTime();
+  end
+  else
+    Self.NextWorldHopTime := GetTickCount() + 120000;
+end;
+
+function TCrabTrapper.GetState(): ECrabTrapState;
+var
+  I: Int32;
+  AllTrapsBaited: Boolean;
+  FirstTrapWithCrab: Int32;
+  OldestBaitTime: UInt64;
+  WaitTicks: Int32;
+begin
+  if WL.Activity.IsFinished() then
+    Exit(ECrabTrapState.END_SCRIPT);
+  
+  FirstTrapWithCrab := -1;
+  OldestBaitTime := High(UInt64);
+  WaitTicks := Self.GetCrabWaitTicks(Self.TargetCrabType);
+  
+  for I := 0 to High(Self.Traps) do
+  begin
+    if Self.Traps[I].IsBaited then
+    begin
+      if (GetTickCount() - Self.Traps[I].BaitTime) < (WaitTicks * 600) then
+        Continue;
+      
+      if Self.DoesTrapHaveCrab(Self.Traps[I].Location, True) then
+        if not Self.Traps[I].HasCrab then
+          Self.Traps[I].HasCrab := True;
+      
+      if Self.ShouldCheckTrapForCrab(I) then
+        if not Self.Traps[I].HasCrab then
+          Self.Traps[I].HasCrab := True;
+      
+      if Self.Traps[I].HasCrab then
+      begin
+        if Self.Traps[I].BaitTime < OldestBaitTime then
+        begin
+          OldestBaitTime := Self.Traps[I].BaitTime;
+          FirstTrapWithCrab := I;
+        end;
+      end;
+    end;
+  end;
+  
+  if Inventory.IsFull() then
+    Exit(ECrabTrapState.MANAGE_INVENTORY);
+  
+  if FirstTrapWithCrab >= 0 then
+    Exit(ECrabTrapState.EMPTY_TRAPS);
+  
+  AllTrapsBaited := True;
+  for I := 0 to High(Self.Traps) do
+  begin
+    if not Self.Traps[I].IsBaited then
+    begin
+      AllTrapsBaited := False;
+      Break;
+    end;
+  end;
+  
+  if not AllTrapsBaited then
+    Exit(ECrabTrapState.BAIT_TRAPS);
+  
+  Exit(ECrabTrapState.WAIT_FOR_CRABS);
+end;
+
+function TCrabTrapper.GetCurrentActivity(): String;
+var
+  TrapsBaited: Int32;
+  I: Int32;
+begin
+  case Self.State of
+    ECrabTrapState.BAIT_TRAPS:
+    begin
+      TrapsBaited := 0;
+      for I := 0 to High(Self.Traps) do
+        if Self.Traps[I].IsBaited then
+          Inc(TrapsBaited);
+      Result := 'Baiting traps (' + ToStr(TrapsBaited) + '/' + ToStr(Self.TrapCount) + ')';
+    end;
+    ECrabTrapState.WAIT_FOR_CRABS: Result := 'Waiting for crabs';
+    ECrabTrapState.EMPTY_TRAPS: Result := 'Emptying traps';
+    ECrabTrapState.MANAGE_INVENTORY: Result := 'Managing inventory';
+    ECrabTrapState.END_SCRIPT: Result := 'Ending';
+    else Result := 'Unknown';
+  end;
+end;
+
+procedure TCrabTrapper.DrawUIOverlay(drawBox: TBox; title, status, runtime: String);
+var
+  yPos: Int32;
+begin
+  {$IFNDEF SRL_DISABLE_REMOTEINPUT}
+  RSClient.Image().DrawBoxFilled(drawBox, False, $2D2D30);
+  RSClient.Image().DrawBoxFilled(drawBox.Expand(1), False, $FFFFFF);
+  RSClient.Image().DrawBoxFilled(drawBox, False, $2D2D30);
+
+  RSClient.Image().SetFontName('Arial');
+  RSClient.Image().SetFontSize(10);
+
+  yPos := drawBox.Y1 + 6;
+
+  RSClient.Image().SetFontSize(13);
+  RSClient.Image().DrawText(title, Point(drawBox.X1 + 3, yPos), $00D4FF);
+  yPos += 14;
+
+  RSClient.Image().SetFontSize(11);
+  RSClient.Image().DrawText('Status: ' + status, Point(drawBox.X1 + 3, yPos), $FFFFFF);
+  yPos += 12;
+  RSClient.Image().DrawText('Runtime: ' + runtime, Point(drawBox.X1 + 3, yPos), $FFFFFF);
+  yPos += 12;
+  {$ENDIF}
+end;
+
+procedure TCrabTrapper.DrawStatusDisplay();
+var
+  statusBox: TBox;
+  currentActivity, runtime: String;
+begin
+  statusBox := Box(10, 260, 150, 320);
+
+  currentActivity := Self.GetCurrentActivity();
+  runtime := SRL.MsToTime(GetTimeRunning(), Time_Short);
+
+  Self.DrawUIOverlay(statusBox, 'BigAussie''s Crab Trapper', currentActivity, runtime);
+end;
+
+procedure TCrabTrapper.Report();
+var
+  TrapsBaited, TrapsWithCrabs: Int32;
+  I: Int32;
+  CurrentXP: Integer;
+  TotalXPGained: Integer;
+  XPPerHour: Integer;
+  HunterXPPerHour: Integer;
+  CookingXPPerHour: Integer;
+  Runtime: UInt64;
+begin
+  TrapsBaited := 0;
+  TrapsWithCrabs := 0;
+  
+  for I := 0 to High(Self.Traps) do
+  begin
+    if Self.Traps[I].IsBaited then
+      Inc(TrapsBaited);
+    if Self.Traps[I].HasCrab then
+      Inc(TrapsWithCrabs);
+  end;
+  
+  CurrentXP := Self.SafeReadXPBar();
+  TotalXPGained := CurrentXP - Self.StartXP;
+  Runtime := GetTimeRunning();
+  
+  if Runtime > 0 then
+  begin
+    XPPerHour := Round((TotalXPGained * 3600000) / Runtime);
+    HunterXPPerHour := Round((Self.HunterXP * 3600000) / Runtime);
+    CookingXPPerHour := Round((Self.CookingXP * 3600000) / Runtime);
+  end
+  else
+  begin
+    XPPerHour := 0;
+    HunterXPPerHour := 0;
+    CookingXPPerHour := 0;
+  end;
+  
+  WriteLn('========================================');
+  WriteLn('   BigAussie''s Crab Trapper');
+  WriteLn('========================================');
+  WriteLn('   Runtime: ' + SRL.MsToTime(Runtime, Time_Short));
+  WriteLn('   Crab Type: ' + ToStr(Self.TargetCrabType));
+  WriteLn('   Trap Count: ' + ToStr(Self.TrapCount));
+  WriteLn('   Traps with Crabs: ' + ToStr(TrapsWithCrabs) + '/' + ToStr(Self.TrapCount));
+  WriteLn('   Total XP Gained: ' + FormatRoundedNumber(TotalXPGained));
+
+  if Self.HunterXP > 0 then
+  begin
+    WriteLn('   Hunter XP: ' + FormatRoundedNumber(Self.HunterXP));
+    WriteLn('   Hunter XP/H: ' + FormatRoundedNumber(HunterXPPerHour));
+  end;
+
+  if Self.CookingXP > 0 then
+  begin
+    WriteLn('   Cooking XP: ' + FormatRoundedNumber(Self.CookingXP));
+    WriteLn('   Cooking XP/H: ' + FormatRoundedNumber(CookingXPPerHour));
+    WriteLn('   Total XP/Hour: ' + FormatRoundedNumber(XPPerHour));
+  end;
+
+  if ENABLEWORLDHOPPING then
+  begin
+    WriteLn('   World Hops: ' + ToStr(Self.WorldHopsCompleted));
+    WriteLn('   Next Hop: ' + SRL.MsToTime(Self.NextWorldHopTime - GetTickCount(), Time_Short));
+  end;
+  WriteLn('========================================');
+end;
+
+function TCrabTrapper.FindAllTrapLocations(CrabType: ECrabType; Count: Int32): TPointArray;
+var
+  I: Int32;
+  AllTraps: TPointArray;
+begin
+  SetLength(AllTraps, 0);
+  
+  case CrabType of
+    ECrabType.RED_CRAB:
+    begin
+      for I := 0 to 4 do
+        AllTraps += Self.RedCrabTraps[I].Coordinates;
+    end;
+    ECrabType.BLUE_CRAB:
+    begin
+      for I := 0 to 4 do
+        AllTraps += Self.BlueCrabTrapsNorth[I].Coordinates;
+      for I := 0 to 4 do
+        AllTraps += Self.BlueCrabTrapsEast[I].Coordinates;
+    end;
+    ECrabType.RAINBOW_CRAB:
+    begin
+      for I := 0 to 4 do
+        AllTraps += Self.RainbowCrabTraps[I].Coordinates;
+    end;
+  end;
+  
+  if Length(AllTraps) > Count then
+    SetLength(AllTraps, Count);
+  
+  Result := AllTraps;
+end;
+
+function TCrabTrapper.FindUnbaitedTrap(): Int32;
+var
+  I: Int32;
+begin
+  for I := 0 to High(Self.Traps) do
+  begin
+    if not Self.Traps[I].IsBaited then
+      Exit(I);
+  end;
+  Result := -1;
+end;
+
+function TCrabTrapper.FindTrapIndexByLocation(Location: TPoint): Int32;
+var
+  I: Int32;
+begin
+  Result := -1;
+  for I := 0 to High(Self.Traps) do
+  begin
+    if Self.Traps[I].Location = Location then
+    begin
+      Result := I;
+      Exit;
+    end;
+  end;
+end;
+
+function TCrabTrapper.FindTrapWithCrab(): Int32;
+var
+  I, StartIndex, CheckIndex: Int32;
+  WaitTicks: Int32;
+  TimeSinceBait: UInt64;
+begin
+  Result := -1;
+  WaitTicks := Self.GetCrabWaitTicks(Self.TargetCrabType);
+  
+  StartIndex := Self.LastEmptiedTrapIndex + 1;
+  if StartIndex > High(Self.Traps) then
+    StartIndex := 0;
+  for I := 0 to High(Self.Traps) do
+  begin
+    CheckIndex := (StartIndex + I) mod (High(Self.Traps) + 1);
+    
+    if Self.Traps[CheckIndex].IsBaited and Self.Traps[CheckIndex].HasCrab then
+    begin
+      TimeSinceBait := GetTickCount() - Self.Traps[CheckIndex].BaitTime;
+      if TimeSinceBait < (WaitTicks * 600) then
+        Continue;
+      
+      Result := CheckIndex;
+      Exit;
+    end;
+  end;
+end;
+
+function TCrabTrapper.FindNextTrapWithCrab(ExcludeLocation: TPoint): Int32;
+var
+  CheckIndex, ExcludeIndex: Int32;
+begin
+  Result := -1;
+  
+  ExcludeIndex := Self.FindTrapIndexByLocation(ExcludeLocation);
+  if ExcludeIndex < 0 then
+    ExcludeIndex := Self.LastEmptiedTrapIndex;
+  
+  CheckIndex := ExcludeIndex + 1;
+  if CheckIndex > High(Self.Traps) then
+    CheckIndex := 0;
+  
+  if (Self.Traps[CheckIndex].Location <> ExcludeLocation) and Self.Traps[CheckIndex].IsBaited then
+    Result := CheckIndex;
+end;
+
+function TCrabTrapper.GetBaitItemName(): String;
+begin
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB:
+      Result := 'Fish offcuts';
+    ECrabType.RAINBOW_CRAB:
+      Result := 'Fine fish offcuts';
+    else
+      Result := '';
+  end;
+end;
+
+function TCrabTrapper.HasBait(): Boolean;
+begin
+  Result := Inventory.ContainsItem(Self.GetBaitItemName());
+end;
+
+function TCrabTrapper.GetTrapObject(Location: TPoint): PRSObjectV2;
+var
+  I: Int32;
+begin
+  Result := nil;
+  
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB:
+    begin
+      for I := 0 to 4 do
+      begin
+        if (Length(Self.RedCrabTraps[I].Coordinates) > 0) and 
+           (Self.RedCrabTraps[I].Coordinates[0] = Location) then
+          Exit(@Self.RedCrabTraps[I]);
+      end;
+    end;
+    ECrabType.BLUE_CRAB:
+    begin
+      for I := 0 to 4 do
+      begin
+        if (Length(Self.BlueCrabTrapsNorth[I].Coordinates) > 0) and 
+           (Self.BlueCrabTrapsNorth[I].Coordinates[0] = Location) then
+          Exit(@Self.BlueCrabTrapsNorth[I]);
+      end;
+      for I := 0 to 4 do
+      begin
+        if (Length(Self.BlueCrabTrapsEast[I].Coordinates) > 0) and 
+           (Self.BlueCrabTrapsEast[I].Coordinates[0] = Location) then
+          Exit(@Self.BlueCrabTrapsEast[I]);
+      end;
+    end;
+    ECrabType.RAINBOW_CRAB:
+    begin
+      for I := 0 to 4 do
+      begin
+        if (Length(Self.RainbowCrabTraps[I].Coordinates) > 0) and 
+           (Self.RainbowCrabTraps[I].Coordinates[0] = Location) then
+          Exit(@Self.RainbowCrabTraps[I]);
+      end;
+    end;
+  end;
+end;
+
+function TCrabTrapper.BaitTrapAtLocation(Location: TPoint): Boolean;
+var
+  TrapObj: PRSObjectV2;
+  BaitItem: String;
+  TargetBaitCount: Int32;
+begin
+  TrapObj := Self.GetTrapObject(Location);
+  if TrapObj = nil then
+    Exit(False);
+  
+  BaitItem := Self.GetBaitItemName();
+  if (BaitItem = '') or (Self.LastBaitCount <= 0) then
+    Exit(False);
+  
+  TargetBaitCount := Self.LastBaitCount - 1;
+  TrapObj^.Filter.UpText := False;
+  
+  if not TrapObj^.WalkClick(True, 3) then
+    Exit(False);
+  
+  if not WaitUntil(Inventory.CountItemStack(BaitItem) <= TargetBaitCount, 65, 5000) then
+    Exit(False);
+
+  Self.LastBaitCount := Inventory.CountItemStack(BaitItem);
+  Result := True;
+end;
+
+function TCrabTrapper.EmptyTrapAtLocation(Location: TPoint): Boolean;
+var
+  TrapObj, NextTrapObj: PRSObjectV2;
+  BaitItem, UpText: String;
+  InitialBaitCount, TargetBaitCount, XPBeforeClick, NextTrapIndex, I: Int32;
+  XPGained, NextTrapHovered, WasFull, WasBaited: Boolean;
+  WaitStartTime: UInt64;
+begin
+  TrapObj := Self.GetTrapObject(Location);
+  if TrapObj = nil then
+    Exit(False);
+  
+  BaitItem := Self.GetBaitItemName();
+  if BaitItem = '' then
+    Exit(False);
+  
+  if not TrapObj^.WalkHover(3) then
+    Exit(False);
+  
+  if not MainScreen.GetUpText().Contains('(full)') then
+    if not WaitUntil(MainScreen.GetUpText().Contains('(full)'), 65, 9000) then
+      Exit(False);
+  
+  InitialBaitCount := Inventory.CountItemStack(BaitItem);
+  TargetBaitCount := InitialBaitCount - 1;
+  
+  if InitialBaitCount <= 0 then
+    Exit(False);
+  
+  XPBeforeClick := Self.SafeReadXPBar();
+  
+  if not TrapObj^.Click(True, 2) then
+    Exit(False);
+    
+  WaitUntil(Minimap.HasFlag(), 65, 800);
+  WaitUntil(not Minimap.HasFlag(), 65, 3000);
+
+  NextTrapIndex := Self.FindNextTrapWithCrab(Location);
+  NextTrapHovered := False;
+  NextTrapObj := nil;
+  
+  if NextTrapIndex >= 0 then
+    NextTrapObj := Self.GetTrapObject(Self.Traps[NextTrapIndex].Location);
+  
+  XPGained := Self.WaitForXPGain(XPBeforeClick, 2000);
+  
+  if XPGained and (NextTrapIndex >= 0) and (NextTrapObj <> nil) then
+    NextTrapHovered := NextTrapObj^.Hover(2);
+
+  if Inventory.IsFull() then
+    Exit(False);
+  
+  if not XPGained then
+    Exit(False);
+  
+  if not Self.WaitForBaitDecrease(BaitItem, TargetBaitCount) then
+    Exit(False);
+  
+    if NextTrapHovered and (NextTrapIndex >= 0) and (NextTrapObj <> nil) then
+    begin
+      XPBeforeClick := Self.SafeReadXPBar();
+      InitialBaitCount := Inventory.CountItemStack(BaitItem);
+      TargetBaitCount := InitialBaitCount - 1;
+      
+      if NextTrapObj^.Click(True, 2) then
+      begin
+        UpText := MainScreen.GetUpText();
+        WasFull := UpText.Contains('(full)');
+        WasBaited := UpText.Contains('Baited') or UpText.Contains('baited');
+        
+        if WasFull then
+        begin
+          WaitUntil(Minimap.HasFlag(), 65, 800);
+          WaitUntil(not Minimap.HasFlag(), 65, 3000);
+          
+          XPGained := Self.WaitForXPGain(XPBeforeClick, 2000);
+          
+          if XPGained then
+          begin
+            Self.WaitForBaitDecrease(BaitItem, TargetBaitCount);
+            
+            if NextTrapIndex >= 0 then
+            begin
+              Self.Traps[NextTrapIndex].IsBaited := True;
+              Self.Traps[NextTrapIndex].BaitTime := GetTickCount();
+              Self.Traps[NextTrapIndex].HasCrab := False;
+              
+              WriteLn('[EMPTY_TRAP] Updated trap ' + ToStr(NextTrapIndex + 1) + ' state: IsBaited=True, HasCrab=False, BaitTime=' + ToStr(Self.Traps[NextTrapIndex].BaitTime));
+              
+              Self.LastEmptiedTrapIndex := NextTrapIndex;
+              WriteLn('[EMPTY_TRAP] Updated LastEmptiedTrapIndex to ' + ToStr(Self.LastEmptiedTrapIndex));
+            end;
+          end;
+        end
+        else if WasBaited then
+        begin
+          WaitUntil(XPBar.EarnedXP(), 65, 1200);
+          XPGained := Self.WaitForXPGain(XPBeforeClick, 0);
+          
+          if XPGained then
+          begin
+            Self.WaitForBaitDecrease(BaitItem, TargetBaitCount);
+            
+            if NextTrapIndex >= 0 then
+            begin
+              Self.Traps[NextTrapIndex].IsBaited := True;
+              Self.Traps[NextTrapIndex].BaitTime := GetTickCount();
+              Self.Traps[NextTrapIndex].HasCrab := False;
+              
+              WriteLn('[EMPTY_TRAP] Updated trap ' + ToStr(NextTrapIndex + 1) + ' state: IsBaited=True, HasCrab=False, BaitTime=' + ToStr(Self.Traps[NextTrapIndex].BaitTime));
+              
+              Self.LastEmptiedTrapIndex := NextTrapIndex;
+              WriteLn('[EMPTY_TRAP] Updated LastEmptiedTrapIndex to ' + ToStr(Self.LastEmptiedTrapIndex));
+            end;
+          end
+          else
+          begin
+            UpText := MainScreen.GetUpText();
+            if not UpText.Contains('trap') then
+            begin
+              I := 0;
+              while (I < 5) and (not MainScreen.GetUpText().Contains('trap')) do
+              begin
+                Inc(I);
+                if NextTrapObj^.Hover(2) then
+                  if MainScreen.GetUpText().Contains('trap') then
+                    Break;
+                if I < 5 then
+                  Wait(200, 400);
+              end;
+            end;
+            
+            if MainScreen.GetUpText().Contains('trap') then
+            begin
+              WaitStartTime := GetTickCount();
+              while (GetTickCount() - WaitStartTime < 4000) do
+              begin
+                UpText := MainScreen.GetUpText();
+                if UpText.Contains('(full)') then
+                  Break;
+                if not UpText.Contains('trap') then
+                  if (NextTrapObj <> nil) then
+                    NextTrapObj^.Hover(2);
+                Wait(65, 150);
+              end;
+              
+              if MainScreen.GetUpText().Contains('(full)') then
+              begin
+                XPBeforeClick := Self.SafeReadXPBar();
+                InitialBaitCount := Inventory.CountItemStack(BaitItem);
+                TargetBaitCount := InitialBaitCount - 1;
+                
+                if Inventory.IsFull() then
+                  Exit(False);
+                
+                if NextTrapObj^.Click(True, 2) then
+                begin
+
+                  WaitUntil(Minimap.HasFlag(), 65, 800);
+                  WaitUntil(not Minimap.HasFlag(), 65, 3000);
+                  
+                  XPGained := Self.WaitForXPGain(XPBeforeClick, 2000);
+                  
+                  if XPGained then
+                  begin
+                    Self.WaitForBaitDecrease(BaitItem, TargetBaitCount);
+                    
+                    if NextTrapIndex >= 0 then
+                    begin
+                      Self.Traps[NextTrapIndex].IsBaited := True;
+                      Self.Traps[NextTrapIndex].BaitTime := GetTickCount();
+                      Self.Traps[NextTrapIndex].HasCrab := False;
+                      Self.LastEmptiedTrapIndex := NextTrapIndex;
+                    end;
+                  end;
+                end;
+              end;
+            end;
+          end;
+        end;
+      end;
+    end;
+  
+  Result := True;
+end;
+
+function TCrabTrapper.GetTrapSearchArea(Location: TPoint): TBox;
+var
+  TrapObj: PRSObjectV2;
+  Cuboids: TCuboidExArray;
+  ATPA: T2DPointArray;
+begin
+  TrapObj := Self.GetTrapObject(Location);
+  if TrapObj <> nil then
+  begin
+    if TrapObj^.FindEx(Cuboids, ATPA) then
+    begin
+      if ATPA <> [] then
+        Exit(ATPA[0].Bounds());
+    end;
+  end;
+  
+  Result := [];
+end;
+
+function TCrabTrapper.IsTrapBaited(Location: TPoint): Boolean;
+var
+  SearchArea: TBox;
+  BaitPixelCount: Int32;
+begin
+  SearchArea := Self.GetTrapSearchArea(Location);
+  if SearchArea <> [] then
+  begin
+    BaitPixelCount := SRL.CountColor(TRAP_BAIT_COLOR, SearchArea);
+    Result := BaitPixelCount > 0;
+  end
+  else
+    Result := False;
+end;
+
+function TCrabTrapper.DoesTrapHaveCrab(Location: TPoint; WasBaited: Boolean = True): Boolean;
+var
+  SearchArea: TBox;
+  BaitPixelCount: Int32;
+  TrapObj: PRSObjectV2;
+begin
+  if not WasBaited then
+    Exit(False);
+  
+  TrapObj := Self.GetTrapObject(Location);
+  if TrapObj = nil then
+    Exit(False);
+  
+  SearchArea := Self.GetTrapSearchArea(Location);
+  if SearchArea = [] then
+    Exit(False);
+  
+  BaitPixelCount := SRL.CountColor(TRAP_BAIT_COLOR, SearchArea);
+  Result := BaitPixelCount = 0;
+end;
+
+function TCrabTrapper.ShouldCheckTrapForCrab(TrapIndex: Int32): Boolean;
+var
+  WaitTicks: Int32;
+  CurrentTick: UInt64;
+  TimeSinceBait: UInt64;
+  MinTimeForCrab: UInt64;
+begin
+  WaitTicks := Self.GetCrabWaitTicks(Self.TargetCrabType);
+  CurrentTick := GetTickCount();
+  TimeSinceBait := CurrentTick - Self.Traps[TrapIndex].BaitTime;
+  
+  MinTimeForCrab := (WaitTicks * 600) + TRAP_CRAB_CAUGHT_BUFFER;
+  
+  Result := TimeSinceBait >= MinTimeForCrab;
+end;
+
+procedure TCrabTrapper.BaitTraps();
+var
+  TrapIndex: Int32;
+  TrapLocation: TPoint;
+begin
+  if not Self.HasBait() then
+    TerminateScript('Out of bait');
+  
+  TrapIndex := Self.FindUnbaitedTrap();
+  if TrapIndex = -1 then
+    Exit;
+  
+  TrapLocation := Self.Traps[TrapIndex].Location;
+  
+  if Self.BaitTrapAtLocation(TrapLocation) then
+  begin
+    Self.Traps[TrapIndex].IsBaited := True;
+    Self.Traps[TrapIndex].BaitTime := GetTickCount();
+    Self.Traps[TrapIndex].HasCrab := False;
+    Self.ReadAndTrackXP(True);
+  end;
+end;
+
+procedure TCrabTrapper.WaitForCrabs();
+var
+  I: Int32;
+begin
+  for I := 0 to High(Self.Traps) do
+  begin
+    if Self.Traps[I].IsBaited then
+    begin
+      if Self.DoesTrapHaveCrab(Self.Traps[I].Location, True) then
+        if not Self.Traps[I].HasCrab then
+          Self.Traps[I].HasCrab := True;
+      
+      if Self.ShouldCheckTrapForCrab(I) then
+        if not Self.Traps[I].HasCrab then
+          Self.Traps[I].HasCrab := True;
+    end;
+  end;
+  
+  Self.ReadAndTrackXP(True);
+end;
+
+procedure TCrabTrapper.EmptyTraps();
+var
+  TrapIndex: Int32;
+  TrapLocation: TPoint;
+begin
+  if Inventory.IsFull() then
+    Exit;
+  
+  TrapIndex := Self.FindTrapWithCrab();
+  if TrapIndex = -1 then
+    Exit;
+  
+  TrapLocation := Self.Traps[TrapIndex].Location;
+  
+  if Self.EmptyTrapAtLocation(TrapLocation) then
+  begin
+    WriteLn('[EMPTY_TRAPS] Trap ' + ToStr(TrapIndex + 1) + ' emptied');
+    
+    Self.Traps[TrapIndex].IsBaited := True;
+    Self.Traps[TrapIndex].BaitTime := GetTickCount();
+    Self.Traps[TrapIndex].HasCrab := False;
+    
+    WriteLn('[EMPTY_TRAPS] Updated trap ' + ToStr(TrapIndex + 1) + ' state: IsBaited=True, HasCrab=False, BaitTime=' + ToStr(Self.Traps[TrapIndex].BaitTime));
+    
+    Self.LastEmptiedTrapIndex := TrapIndex;
+    WriteLn('[EMPTY_TRAPS] Updated LastEmptiedTrapIndex to ' + ToStr(Self.LastEmptiedTrapIndex));
+    
+    Self.ReadAndTrackXP(True);
+  end
+  else
+  begin
+    WriteLn('[EMPTY_TRAPS] Failed to empty trap ' + ToStr(TrapIndex + 1));
+  end;
+end;
+
+function TCrabTrapper.GetCrabItemName(): String;
+begin
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB: Result := 'Red crab';
+    ECrabType.BLUE_CRAB: Result := 'Blue crab';
+    ECrabType.RAINBOW_CRAB: Result := 'Rainbow crab';
+    else Result := '';
+  end;
+end;
+
+function TCrabTrapper.GetInventoryManagementMethod(): EInventoryManagement;
+begin
+  if Inventory.ContainsItem('Pestle and mortar') then
+    Exit(EInventoryManagement.USE_PESTLE_AND_MORTAR)
+  else if Inventory.ContainsItem('Knife') then
+    Exit(EInventoryManagement.USE_KNIFE)
+  else
+    Exit(EInventoryManagement.DROP_CRABS);
+end;
+
+function TCrabTrapper.ProcessCrabsWithPestle(): Boolean;
+var
+  CrabItem: String;
+begin
+  CrabItem := Self.GetCrabItemName();
+  
+  if not Inventory.ContainsItem(CrabItem) then
+    Exit(False);
+  
+  if not Inventory.Use('Pestle and mortar', CrabItem) then
+    Exit(False);
+  
+  Result := WaitUntil(Inventory.CountItem(CrabItem) = 0, 100, 60000);
+end;
+
+function TCrabTrapper.ProcessCrabsWithKnife(): Boolean;
+var
+  CrabItem: String;
+begin
+  CrabItem := Self.GetCrabItemName();
+  
+  if not Inventory.ContainsItem(CrabItem) then
+    Exit(False);
+  
+  if not Inventory.Use('Knife', CrabItem) then
+    Exit(False);
+  
+  Result := WaitUntil(Inventory.CountItem(CrabItem) = 0, 100, 60000);
+  
+  if Result then
+    Self.ReadAndTrackXP(False);
+end;
+
+function TCrabTrapper.CookSkinnedCrabs(): Boolean;
+var
+  SkinnedCrabItem: String;
+  StoveObj: PRSObjectV2;
+  I: Int32;
+begin
+  if Self.TargetCrabType = ECrabType.BLUE_CRAB then
+    Exit(False);
+  
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB: 
+    begin
+      SkinnedCrabItem := 'Raw red crab meat';
+      StoveObj := @Self.RedCrabStove;
+    end;
+    ECrabType.RAINBOW_CRAB: 
+    begin
+      SkinnedCrabItem := 'Raw rainbow crab meat';
+      StoveObj := @Self.RainbowCrabStove;
+    end;
+    else
+      Exit(False);
+  end;
+  
+  if not Inventory.ContainsItem(SkinnedCrabItem) then
+    Exit(False);
+  
+  for I := 1 to 5 do
+  begin
+    StoveObj^.WalkSelectOption(['Cook'], 3);
+    
+    if WaitUntil(Make.IsOpen(), 65, 8000) then
+      Break;
+    
+    if I >= 5 then
+      TerminateScript('Failed to open Make interface after 5 attempts');
+  end;
+  
+  if not Make.Select(0, Make.QUANTITY_ALL, False) then
+    Exit(False);
+  
+  WaitUntil(not Make.IsOpen(), 100, 2000);
+  
+  Result := WaitUntil(Inventory.CountItem(SkinnedCrabItem) = 0, 100, 90000);
+  
+  if Result then
+    Self.ReadAndTrackXP(False);
+end;
+
+function TCrabTrapper.BankCookedCrabs(): Boolean;
+var
+  CookedCrabItem: String;
+  I: Int32;
+begin
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB: CookedCrabItem := 'Red crab meat';
+    ECrabType.BLUE_CRAB: CookedCrabItem := 'Blue crab meat';
+    ECrabType.RAINBOW_CRAB: CookedCrabItem := 'Rainbow crab meat';
+    else Exit(False);
+  end;
+  
+  if not Inventory.ContainsItem(CookedCrabItem) then
+    Exit(False);
+  
+  if Self.TargetCrabType <> ECrabType.RED_CRAB then
+    Exit(False);
+  
+  for I := 1 to 5 do
+  begin
+    Self.RedCrabBankChest.WalkSelectOption(['Bank'], 3);
+    
+    if WaitUntil(Bank.IsOpen(), 100, 5000) then
+      Break;
+    
+    if I >= 5 then
+      TerminateScript('Failed to open bank after 5 attempts');
+  end;
+  
+  Bank.DepositItem(CookedCrabItem, True);
+  
+  Result := WaitUntil(Inventory.CountItem(CookedCrabItem) = 0, 100, 5000);
+  
+  Bank.Close();
+end;
+
+function TCrabTrapper.DropCrabs(): Boolean;
+var
+  CrabItem: String;
+  I: Int32;
+  ItemCount: Int32;
+begin
+  CrabItem := Self.GetCrabItemName();
+  if not Inventory.ContainsItem(CrabItem) then
+    Exit(False);
+  
+  for I := 1 to 5 do
+  begin
+    ItemCount := Inventory.CountItem(CrabItem);
+    if ItemCount = 0 then
+      Exit(True);
+    
+    Inventory.ShiftDrop([CrabItem], DROP_PATTERN_SNAKE);
+    
+    if WaitUntil(Inventory.CountItem(CrabItem) = 0, 100, 5000) then
+      Exit(True);
+    
+    if I < 5 then
+      Wait(200, 400);
+  end;
+  
+  Result := Inventory.CountItem(CrabItem) = 0;
+end;
+
+function TCrabTrapper.DropItem(ItemName: String): Boolean;
+var
+  I: Int32;
+  ItemCount: Int32;
+begin
+  if not Inventory.ContainsItem(ItemName) then
+    Exit(False);
+  
+  for I := 1 to 5 do
+  begin
+    ItemCount := Inventory.CountItem(ItemName);
+    if ItemCount = 0 then
+      Exit(True);
+    
+    Inventory.ShiftDrop([ItemName], DROP_PATTERN_SNAKE);
+    
+    if WaitUntil(Inventory.CountItem(ItemName) = 0, 100, 5000) then
+      Exit(True);
+    
+    if I < 5 then
+      Wait(200, 400);
+  end;
+  
+  Result := Inventory.CountItem(ItemName) = 0;
+end;
+
+procedure TCrabTrapper.ManageInventory();
+var
+  Method: EInventoryManagement;
+  CookedCrabItem: String;
+begin
+  WriteLn('[MANAGE_INVENTORY] Managing inventory...');
+  
+  case Self.TargetCrabType of
+    ECrabType.RED_CRAB: CookedCrabItem := 'Red crab meat';
+    ECrabType.RAINBOW_CRAB: CookedCrabItem := 'Rainbow crab meat';
+    ECrabType.BLUE_CRAB: CookedCrabItem := '';
+  end;
+  
+  if (CookedCrabItem <> '') and Inventory.ContainsItem(CookedCrabItem) then
+  begin
+    if (Self.TargetCrabType = ECrabType.RED_CRAB) and USE_BANK_FOR_RED_CRABS then
+      Self.BankCookedCrabs()
+    else
+      Self.DropItem(CookedCrabItem);
+    Exit;
+  end;
+  
+  Method := Self.GetInventoryManagementMethod();
+  
+  case Method of
+    EInventoryManagement.USE_PESTLE_AND_MORTAR:
+      Self.ProcessCrabsWithPestle();
+    
+    EInventoryManagement.USE_KNIFE:
+    begin
+      if Self.ProcessCrabsWithKnife() then
+      begin
+        if (Self.TargetCrabType = ECrabType.RED_CRAB) or (Self.TargetCrabType = ECrabType.RAINBOW_CRAB) then
+        begin
+          if Self.CookSkinnedCrabs() then
+          begin
+            if (Self.TargetCrabType = ECrabType.RED_CRAB) and USE_BANK_FOR_RED_CRABS then
+            begin
+              Self.BankCookedCrabs();
+            end
+            else
+            begin
+              case Self.TargetCrabType of
+                ECrabType.RED_CRAB: Self.DropItem('Red crab meat');
+                ECrabType.RAINBOW_CRAB: Self.DropItem('Rainbow crab meat');
+              end;
+            end;
+          end;
+        end
+        else if Self.TargetCrabType = ECrabType.BLUE_CRAB then
+        begin
+          if Inventory.ContainsItem('Raw blue crab') then
+          begin
+            WriteLn('[MANAGE_INVENTORY] Blue crabs cannot be cooked, dropping raw blue crabs');
+            Self.DropItem('Raw blue crab');
+          end;
+        end;
+      end;
+    end;
+    
+    EInventoryManagement.DROP_CRABS:
+      Self.DropCrabs();
+  end;
+end;
+
+
+procedure TCrabTrapper.Run(MaxActions: UInt32; MaxTime: UInt64);
+begin
+  Self.Init(MaxActions, MaxTime);
+  
+  try
+    if RSClient.RemoteInput.IsSetup() then
+      RSClient.Image().Clear();
+  except
+  end;
+  
+  Self.DrawStatusDisplay();
+  
+  repeat
+    Self.CheckHourlyReport();
+    
+    if Self.ShouldHopWorld() then
+    begin
+      Self.DoWorldHop();
+      Wait(2000, 4000);
+    end;
+    
+    Self.State := Self.GetState();
+    Self.SetAction(ToStr(Self.State));
+    
+    case Self.State of
+      ECrabTrapState.BAIT_TRAPS: Self.BaitTraps();
+      ECrabTrapState.WAIT_FOR_CRABS: Self.WaitForCrabs();
+      ECrabTrapState.EMPTY_TRAPS: Self.EmptyTraps();
+      ECrabTrapState.MANAGE_INVENTORY: Self.ManageInventory();
+      ECrabTrapState.END_SCRIPT: Break;
+    end;
+    
+    if (GetTickCount() - Self.LastImageClear) >= 30000 then
+    begin
+      try
+        RSClient.Image.Clear;
+      except
+      end;
+      Self.DrawStatusDisplay();
+      Self.LastImageClear := GetTickCount();
+    end;
+    
+    if (GetTimeRunning() mod 1000) < 500 then
+      Self.DrawStatusDisplay();
+    
+    if (GetTickCount() - Self.LastReportTime) >= 10000 then
+    begin
+      Self.Report();
+      Self.LastReportTime := GetTickCount();
+    end;
+    
+  until Self.ShouldStop();
+  
+  Self.Report();
+end;
+
+{$IFDEF SCRIPT_GUI}
+type
+  TConfig = record(TScriptForm)
+    EnableWorldHoppingCheckBox: TLabeledCheckBox;
+    WorldHopIntervalInput: TLabeledEdit;
+    CrabTypeComboBox: TLabeledComboBox;
+    UseBankForRedCrabsCheckBox: TLabeledCheckBox;
+    TrapCountComboBox: TLabeledComboBox;
+    Username: String;
+    
+    WebhookLabel: TLabel;
+    WEBHOOKURL: TLabeledEdit;
+    PingOnTerminatedCheckBox, EnableWebhooksCheckBox,
+    HourlyReportsCheckBox, SessionSummaryCheckBox: TLabeledCheckBox;
+    TestButton: TButton;
+    SavedWebhookURL: String;
+    DiscordPanel: TLabeledPanel;
+    WebHookInput: TLabeledEdit;
+  end;
+
+procedure TConfig.UpdateAccountValues(sender: TObject);
+var
+  selector: TComboBox;
+  user, pass, pin: TEdit;
+  worlds: TMemo;
+  idx: Int32;
+  worldsStr: String;
+  i: Int32;
+begin
+  selector := TComboBox(Self.Form.GetChild('am_selector_combobox'));
+  idx := selector.GetItemIndex();
+
+  if (idx < 0) or (idx > High(Login.Players)) then Exit;
+  
+  Self.SaveUserSettings();
+
+  Login.PlayerIndex := idx;
+
+  user := TEdit(Self.Form.GetChild('am_user_edit'));
+  pass := TEdit(Self.Form.GetChild('am_pass_edit'));
+  pin := TEdit(Self.Form.GetChild('am_pin_edit'));
+  worlds := TMemo(Self.Form.GetChild('am_worlds_memo'));
+
+  user.SetText(Login.Players[idx].User);
+  pass.SetText(Login.Players[idx].Password);
+  pin.SetText(Login.Players[idx].Pin);
+
+  worldsStr := '';
+  for i := 0 to High(Login.Players[idx].Worlds) do
+  begin
+    worldsStr += ToStr(Login.Players[idx].Worlds[i]);
+    if i < High(Login.Players[idx].Worlds) then
+      worldsStr += ', ';
+  end;
+  worlds.SetText(worldsStr);
+
+  Self.LoadUserSettings();
+end;
+
+procedure TConfig.InitializeAccountManager;
+var
+  selector: TComboBox;
+begin
+  selector := TComboBox(Self.Form.GetChild('am_selector_combobox'));
+  selector.SetOnChange(@UpdateAccountValues);
+end;
+
+procedure TConfig.WebhooksCheckboxChanged({$H-}sender: TObject){$H+};
+begin
+  Self.WebhookLabel.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+  if Assigned(Self.DiscordPanel) then
+    Self.DiscordPanel.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+  if Assigned(Self.WebHookInput) then
+    Self.WebHookInput.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+  if Assigned(Self.TestButton) then
+    Self.TestButton.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+  if Assigned(Self.HourlyReportsCheckBox) then
+    Self.HourlyReportsCheckBox.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+  if Assigned(Self.SessionSummaryCheckBox) then
+    Self.SessionSummaryCheckBox.SetVisible(Self.EnableWebhooksCheckBox.IsChecked());
+end;
+
+procedure TConfig.WorldHoppingCheckboxChanged({$H-}sender: TObject){$H+};
+begin
+  if Assigned(Self.WorldHopIntervalInput) then
+    Self.WorldHopIntervalInput.SetVisible(Self.EnableWorldHoppingCheckBox.IsChecked());
+end;
+
+procedure TConfig.LoadUserSettings();
+var
+  SavedCrabType: Int32;
+  SavedTrapCount: Int32;
+  SavedEnableWorldHopping, SavedUseBankForRedCrabs: Boolean;
+  SavedWorldHopInterval: Int32;
+  SavedWebhookURL: String;
+  SavedPingOnTerminated, SavedEnableWebhooks: Boolean;
+  SavedHourlyReports, SavedSessionSummary: Boolean;
+begin
+  if (Login.PlayerIndex < 0) or (Login.PlayerIndex > High(Login.Players)) then
+    Username := 'NoUserNameSelected'
+  else
+    Username := Login.Players[Login.PlayerIndex].User;
+
+  if Username = '' then Exit;
+
+  SavedCrabType := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'CrabType', 'Configs/BASettings.ini'), 0);
+  SavedTrapCount := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'TrapCount', 'Configs/BASettings.ini'), 0);
+  SavedUseBankForRedCrabs := StrToBoolDef(ReadINI(Username + ' Crab Trapper Settings', 'UseBankForRedCrabs', 'Configs/BASettings.ini'), False);
+  SavedEnableWorldHopping := StrToBoolDef(ReadINI(Username + ' Crab Trapper Settings', 'EnableWorldHopping', 'Configs/BASettings.ini'), False);
+  SavedWorldHopInterval := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'WorldHopInterval', 'Configs/BASettings.ini'), 45);
+
+  SavedWebhookURL := ReadINI(Username + ' Webhook Settings', 'WebhookURL', 'Configs/BASettings.ini');
+  SavedEnableWebhooks := StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'EnableWebhooks', 'Configs/BASettings.ini'), False);
+  SavedPingOnTerminated := StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'PingOnTerminated', 'Configs/BASettings.ini'), True);
+  SavedHourlyReports := StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'HourlyReports', 'Configs/BASettings.ini'), True);
+  SavedSessionSummary := StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'SessionSummary', 'Configs/BASettings.ini'), True);
+
+  if Assigned(Self.CrabTypeComboBox) then
+  begin
+    if (SavedCrabType >= 0) and (SavedCrabType <= 2) then
+      Self.CrabTypeComboBox.SetItemIndex(SavedCrabType)
+    else
+      Self.CrabTypeComboBox.SetItemIndex(0);
+  end;
+
+  if Assigned(Self.TrapCountComboBox) then
+  begin
+    if (SavedTrapCount >= 0) and (SavedTrapCount <= 5) then
+      Self.TrapCountComboBox.SetItemIndex(SavedTrapCount)
+    else
+      Self.TrapCountComboBox.SetItemIndex(0);
+  end;
+
+  if Assigned(Self.UseBankForRedCrabsCheckBox) then
+    Self.UseBankForRedCrabsCheckBox.SetChecked(SavedUseBankForRedCrabs);
+
+  if Assigned(Self.EnableWorldHoppingCheckBox) then
+    Self.EnableWorldHoppingCheckBox.SetChecked(SavedEnableWorldHopping);
+
+  if Assigned(Self.WorldHopIntervalInput) then
+    Self.WorldHopIntervalInput.SetText(ToStr(SavedWorldHopInterval));
+
+  if Assigned(Self.EnableWebhooksCheckBox) then
+  begin
+    Self.EnableWebhooksCheckBox.SetChecked(SavedEnableWebhooks);
+    Self.WebhooksCheckboxChanged(Self.EnableWebhooksCheckBox.CheckBox);
+  end;
+
+  if Assigned(Self.WEBHOOKURL) then
+    Self.WEBHOOKURL.SetText(SavedWebhookURL);
+
+  if Assigned(Self.WebHookInput) then
+    Self.WebHookInput.SetText(SavedWebhookURL);
+
+  if Assigned(Self.PingOnTerminatedCheckBox) then
+    Self.PingOnTerminatedCheckBox.SetChecked(SavedPingOnTerminated);
+
+  if Assigned(Self.HourlyReportsCheckBox) then
+    Self.HourlyReportsCheckBox.SetChecked(SavedHourlyReports);
+
+  if Assigned(Self.SessionSummaryCheckBox) then
+    Self.SessionSummaryCheckBox.SetChecked(SavedSessionSummary);
+end;
+
+procedure TConfig.SaveUserSettings();
+var
+  Username: String;
+  CrabTypeIndex: Int32;
+begin
+  if (Login.PlayerIndex < 0) or (Login.PlayerIndex > High(Login.Players)) then
+    Username := 'NoUserNameSelected'
+  else
+    Username := Login.Players[Login.PlayerIndex].User;
+
+  if Username = '' then Exit;
+
+  if Assigned(Self.EnableWorldHoppingCheckBox) then
+    ENABLEWORLDHOPPING := Self.EnableWorldHoppingCheckBox.IsChecked();
+
+  if Assigned(Self.WorldHopIntervalInput) then
+    WORLDHOPINTERVAL := StrToIntDef(Self.WorldHopIntervalInput.GetText(), 45);
+
+  if Assigned(Self.CrabTypeComboBox) then
+    CrabTypeIndex := Self.CrabTypeComboBox.GetItemIndex()
+  else
+    CrabTypeIndex := 0;
+
+  if Assigned(Self.UseBankForRedCrabsCheckBox) then
+    USE_BANK_FOR_RED_CRABS := Self.UseBankForRedCrabsCheckBox.IsChecked();
+
+  if Assigned(Self.TrapCountComboBox) then
+    TRAP_COUNT_MODE := Self.TrapCountComboBox.GetItemIndex();
+
+  if Assigned(Self.EnableWebhooksCheckBox) then
+    ENABLEWEBHOOKS := Self.EnableWebhooksCheckBox.IsChecked();
+
+  if Assigned(Self.PingOnTerminatedCheckBox) then
+    PINGONTERMINATED := Self.PingOnTerminatedCheckBox.IsChecked();
+
+  if Assigned(Self.HourlyReportsCheckBox) then
+    SENDHOURLYREPORTMSG := Self.HourlyReportsCheckBox.IsChecked();
+
+  if Assigned(Self.SessionSummaryCheckBox) then
+    SENDSESSIONSUMMARYMSG := Self.SessionSummaryCheckBox.IsChecked();
+
+  if Assigned(Self.WebHookInput) then
+    SavedWebhookURL := Self.WebHookInput.GetText();
+
+  WriteINI(Username + ' Crab Trapper Settings', 'CrabType', ToStr(CrabTypeIndex), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Crab Trapper Settings', 'TrapCount', ToStr(TRAP_COUNT_MODE), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Crab Trapper Settings', 'UseBankForRedCrabs', BoolToStr(USE_BANK_FOR_RED_CRABS, 'true', 'false'), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Crab Trapper Settings', 'EnableWorldHopping', BoolToStr(ENABLEWORLDHOPPING, 'true', 'false'), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Crab Trapper Settings', 'WorldHopInterval', ToStr(WORLDHOPINTERVAL), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Webhook Settings', 'WebhookURL', SavedWebhookURL, 'Configs/BASettings.ini');
+  WriteINI(Username + ' Webhook Settings', 'PingOnTerminated', BoolToStr(PINGONTERMINATED, 'true', 'false'), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Webhook Settings', 'EnableWebhooks', BoolToStr(ENABLEWEBHOOKS, 'true', 'false'), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Webhook Settings', 'HourlyReports', BoolToStr(SENDHOURLYREPORTMSG, 'true', 'false'), 'Configs/BASettings.ini');
+  WriteINI(Username + ' Webhook Settings', 'SessionSummary', BoolToStr(SENDSESSIONSUMMARYMSG, 'true', 'false'), 'Configs/BASettings.ini');
+end;
+
+procedure TConfig.StartScript(sender: TObject); override;
+begin
+  Self.SaveUserSettings();
+  
+  Discord.SetWebhook(SavedWebhookURL);
+  
+  if Assigned(Self.EnableWorldHoppingCheckBox) then
+    ENABLEWORLDHOPPING := Self.EnableWorldHoppingCheckBox.IsChecked();
+  
+  if Assigned(Self.WorldHopIntervalInput) then
+    WORLDHOPINTERVAL := StrToIntDef(Self.WorldHopIntervalInput.GetText(), 45);
+  
+  if Assigned(Self.CrabTypeComboBox) then
+  begin
+    case Self.CrabTypeComboBox.GetItemIndex() of
+      0: SELECTEDCRABTYPE := ECrabType.RED_CRAB;
+      1: SELECTEDCRABTYPE := ECrabType.BLUE_CRAB;
+      2: SELECTEDCRABTYPE := ECrabType.RAINBOW_CRAB;
+      else SELECTEDCRABTYPE := ECrabType.RED_CRAB;
+    end;
+  end;
+  
+  if Assigned(Self.UseBankForRedCrabsCheckBox) then
+    USE_BANK_FOR_RED_CRABS := Self.UseBankForRedCrabsCheckBox.IsChecked();
+  
+  if Assigned(Self.TrapCountComboBox) then
+    TRAP_COUNT_MODE := Self.TrapCountComboBox.GetItemIndex();
+  
+  inherited;
+end;
+
+procedure TConfig.OpenURL(Sender: TObject);
+begin
+  if Sender = Self.WebhookLabel then
+    OpenWebPage('https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks');
+end;
+
+procedure TConfig.TestButtonClick({$H-}sender: TObject){$H+};
+begin
+  if Self.WebHookInput.GetText = '' then
+  begin
+    ShowMessage('Please enter a Webhook URL');
+    Exit;
+  end;
+  Discord.Webhook.Content := ('Test message');
+  Discord.Webhook.URL := Self.WebHookInput.GetText;
+  Discord.Send();
+  ShowMessage('Test message sent. Please check Discord.');
+end;
+
+procedure TConfig.Run(); override;
+var
+  tab: TTabSheet;
+  SavedCrabType, SavedTrapCount, SavedWorldHopInterval: Int32;
+  SavedEnableWorldHopping, SavedUseBankForRedCrabs: Boolean;
+begin
+  Self.Setup('BigAussies Crab Trapper');
+  Self.Start.SetOnClick(@Self.StartScript);
+
+  Self.AddTab('Script Settings');
+  tab := Self.Tabs[High(Self.Tabs)];
+
+  Self.CreateAccountManager(tab);
+  
+  Self.InitializeAccountManager();
+  
+  if (Login.PlayerIndex < 0) or (Login.PlayerIndex > High(Login.Players)) then
+    Username := 'NoUserNameSelected'
+  else
+    Username := Login.Players[Login.PlayerIndex].User;
+
+  if Username <> '' then
+  begin
+    SavedCrabType := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'CrabType', 'Configs/BASettings.ini'), 0);
+    SavedTrapCount := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'TrapCount', 'Configs/BASettings.ini'), 0);
+    SavedUseBankForRedCrabs := StrToBoolDef(ReadINI(Username + ' Crab Trapper Settings', 'UseBankForRedCrabs', 'Configs/BASettings.ini'), False);
+    SavedEnableWorldHopping := StrToBoolDef(ReadINI(Username + ' Crab Trapper Settings', 'EnableWorldHopping', 'Configs/BASettings.ini'), False);
+    SavedWorldHopInterval := StrToIntDef(ReadINI(Username + ' Crab Trapper Settings', 'WorldHopInterval', 'Configs/BASettings.ini'), 45);
+  end
+  else
+  begin
+    SavedCrabType := 0;
+    SavedTrapCount := 0;
+    SavedUseBankForRedCrabs := False;
+    SavedEnableWorldHopping := False;
+    SavedWorldHopInterval := 45;
+  end;
+  
+  with Self.CrabTypeComboBox do
+  begin
+    Create(tab);
+    SetCaption('Crab Type:');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(140));
+    SetWidth(TControl.AdjustToDPI(200));
+    SetStyle(csDropDownList);
+    AddItemArray(['Red Crab', 'Blue Crab', 'Rainbow Crab']);
+    if (SavedCrabType >= 0) and (SavedCrabType <= 2) then
+      SetItemIndex(SavedCrabType)
+    else
+      SetItemIndex(0);
+    SetHint('Select which type of crab to trap');
+  end;
+  
+  with Self.TrapCountComboBox do
+  begin
+    Create(tab);
+    SetCaption('Trap Count:');
+    SetLeft(TControl.AdjustToDPI(250));
+    SetTop(TControl.AdjustToDPI(140));
+    SetWidth(TControl.AdjustToDPI(200));
+    SetStyle(csDropDownList);
+    AddItemArray(['Automatic', '1 trap', '2 traps', '3 traps', '4 traps', '5 traps']);
+    if (SavedTrapCount >= 0) and (SavedTrapCount <= 5) then
+      SetItemIndex(SavedTrapCount)
+    else
+      SetItemIndex(0);
+    SetHint('Select number of traps to use. Automatic uses your hunter level to determine the number of traps to use.');
+  end;
+  
+  with Self.UseBankForRedCrabsCheckBox do
+  begin
+    Create(tab);
+    SetCaption('Bank Cooked Red Crabs?');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(185));
+    SetChecked(SavedUseBankForRedCrabs);
+    SetHint('If enabled, will bank cooked red crabs instead of dropping them');
+  end;
+  
+  with Self.EnableWorldHoppingCheckBox do
+  begin
+    Create(tab);
+    SetCaption('Enable World Hopping');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(205));
+    SetChecked(SavedEnableWorldHopping);
+    SetHint('Enable automatic world hopping at regular intervals');
+    CheckBox.SetOnChange(@WorldHoppingCheckboxChanged);
+  end;
+  
+  with Self.WorldHopIntervalInput do
+  begin
+    Create(tab);
+    SetCaption('World Hop Interval (minutes):');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(225));
+    SetText(ToStr(SavedWorldHopInterval));
+    SetHint('How often to hop worlds (in minutes)');
+    SetVisible(SavedEnableWorldHopping);
+  end;
+
+  if Username <> '' then
+    SavedWebhookURL := ReadINI(Username + ' Webhook Settings', 'WebhookURL', 'Configs/BASettings.ini')
+  else
+    SavedWebhookURL := '';
+
+  with Self.EnableWebhooksCheckBox do
+  begin
+    Create(tab);
+    SetCaption('Discord Notifications');
+    SetLeft(TControl.AdjustToDPI(30));
+    SetTop(TControl.AdjustToDPI(270));
+    SetChecked(StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'EnableWebhooks', 'Configs/BASettings.ini'), False));
+    SetHint('Enable to use Discord notifications.');
+    CheckBox.SetOnChange(@WebhooksCheckboxChanged);
+  end;
+
+  Self.DiscordPanel := Self.CreateLabeledPanel(tab, 'Discord Settings', Self.EnableWebhooksCheckBox.GetTop() + TControl.AdjustToDPI(50), 100, 10, clBlue);
+  Self.DiscordPanel.SetLeft(TControl.AdjustToDPI(10));
+
+  with Self.WebHookInput do
+  begin
+    Create(Self.DiscordPanel.Panel);
+    SetCaption('Webhook URL');
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(TControl.AdjustToDPI(25));
+    SetWidth(TControl.AdjustToDPI(450));
+    SetText(SavedWebhookURL);
+    SetPasswordChar('*');
+  end;
+
+  with Self.TestButton do
+  begin
+    Create(Self.DiscordPanel.Panel);
+    SetCaption('Test Webhook');
+    SetLeft(Self.WebHookInput.GetRight + TControl.AdjustToDPI(10));
+    SetTop(Self.WebHookInput.GetTop + TControl.AdjustToDPI(15));
+    SetWidth(TControl.AdjustToDPI(90));
+    SetHeight(TControl.AdjustToDPI(25));
+    SetOnClick(@TestButtonClick);
+  end;
+
+  with Self.HourlyReportsCheckBox do
+  begin
+    Create(Self.DiscordPanel.Panel);
+    SetCaption('Hourly Progress Reports');
+    SetLeft(TControl.AdjustToDPI(20));
+    SetTop(Self.WebHookInput.GetTop + TControl.AdjustToDPI(50));
+    SetHint('Sends detailed progress embeds every hour');
+    SetChecked(StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'HourlyReports', 'Configs/BASettings.ini'), True));
+  end;
+
+  with Self.SessionSummaryCheckBox do
+  begin
+    Create(Self.DiscordPanel.Panel);
+    SetCaption('Session Summary on Stop');
+    SetLeft(Self.HourlyReportsCheckBox.GetRight + TControl.AdjustToDPI(20));
+    SetTop(Self.HourlyReportsCheckBox.GetTop);
+    SetHint('Sends a detailed summary embed when script stops');
+    SetChecked(StrToBoolDef(ReadINI(Username + ' Webhook Settings', 'SessionSummary', 'Configs/BASettings.ini'), True));
+  end;
+
+  with Self.WebhookLabel do
+  begin
+    Create(tab);
+    SetLeft(Self.EnableWebhooksCheckBox.GetLeft());
+    SetTop(Self.EnableWebhooksCheckBox.GetTop() + TControl.AdjustToDPI(25));
+    SetCaption('Click here to learn how to generate your own Discord webhook URL');
+    SetHint('Click here to learn how to generate your own Discord webhook URL');
+    setOnClick(@OpenURL);
+    SetFontSize(TControl.AdjustToDPI(9));
+    SetFontColor(clBlue);
+  end;
+
+  Self.WebhooksCheckboxChanged(nil);
+
+  Self.CreateAntibanManager();
+  Self.CreateWaspLibSettings();
+  
+  Self.LoadUserSettings();
+
+  inherited;
+end;
+
+function TConfig.CreateLabeledPanel(owner: TControl; title: String; top, height: Int32; FontSize: Int32 = 10; Color: TColor = clBlack; FontStyles: TFontStyles = [fsBold]): TLabeledPanel;
+var
+  verticalSpacing: Int32;
+begin
+  verticalSpacing := TControl.AdjustToDPI(3);
+  Result.Create(owner);
+  with Result do
+  begin
+    SetCaption(title);
+
+    Panel.SetCaption('');
+    Panel.SetBevelWidth(1);
+    Panel.SetBevelInner(bvRaised);
+    Panel.SetBevelOuter(bvLowered);
+    Panel.SetTop(top + verticalSpacing);
+    Panel.SetWidth(Self.Form.GetWidth - TControl.AdjustToDPI(25));
+    Panel.SetHeight(TControl.AdjustToDPI(height));
+    Panel.SetBorderStyle(bsNone);
+
+    Caption.SetFontSize(FontSize);
+    Caption.SetFontColor(Color);
+    Caption.GetFont().SetStyle(FontStyles);
+  end;
+end;
+
+var
+  Config: TConfig;
+{$ENDIF}
+
+var
+  CrabTrapper: TCrabTrapper;
+
+procedure TCrabTrapper.SendHourlyReport();
+var
+  EmbedIdx: Int32;
+  XPPerHour, HunterXPPerHour, CookingXPPerHour: Int32;
+  Runtime: UInt64;
+begin
+  if not SENDHOURLYREPORTMSG then Exit;
+  
+  Runtime := GetTimeRunning();
+  if Runtime > 0 then
+  begin
+    XPPerHour := Round(((Self.LastXP - Self.StartXP) * 3600000) / Runtime);
+    HunterXPPerHour := Round((Self.HunterXP * 3600000) / Runtime);
+    CookingXPPerHour := Round((Self.CookingXP * 3600000) / Runtime);
+  end
+  else
+  begin
+    XPPerHour := 0;
+    HunterXPPerHour := 0;
+    CookingXPPerHour := 0;
+  end;
+  
+  try
+    Discord.Webhook.Content := '**Hourly Progress Report** :chart_with_upwards_trend:';
+    
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    Discord.Webhook.Embeds[EmbedIdx].Title := 'BigAussies Crab Trapper - Hourly Report';
+    Discord.Webhook.Embeds[EmbedIdx].Color := $FFA500;
+    Discord.Webhook.Embeds[EmbedIdx].Description := 'Runtime: ' + SRL.MsToTime(Runtime, Time_Short) + LineEnding +
+                                                    'Crab Type: ' + ToStr(Self.TargetCrabType) + LineEnding +
+                                                    'Trap Count: ' + ToStr(Self.TrapCount) + LineEnding +
+                                                    'Total XP Gained: ' + FormatRoundedNumber(Self.LastXP - Self.StartXP) + LineEnding +
+                                                    'Hunter XP: ' + FormatRoundedNumber(Self.HunterXP) + ' (' + FormatRoundedNumber(HunterXPPerHour) + '/hr)' + LineEnding +
+                                                    'Cooking XP: ' + FormatRoundedNumber(Self.CookingXP) + ' (' + FormatRoundedNumber(CookingXPPerHour) + '/hr)' + LineEnding +
+                                                    'Total XP/Hour: ' + FormatRoundedNumber(XPPerHour);
+    
+    if Discord.Send() then
+      WriteLn('[Discord] Hourly report sent!')
+    else
+      WriteLn('[Discord] Failed to send hourly report: ' + Discord.LastError);
+  except
+    WriteLn('[Discord] Error sending hourly report: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure TCrabTrapper.SendSessionSummary();
+var
+  EmbedIdx: Int32;
+  XPPerHour, HunterXPPerHour, CookingXPPerHour: Int32;
+  Runtime: UInt64;
+begin
+  if not SENDSESSIONSUMMARYMSG then Exit;
+  
+  Runtime := GetTimeRunning();
+  if Runtime > 0 then
+  begin
+    XPPerHour := Round(((Self.LastXP - Self.StartXP) * 3600000) / Runtime);
+    HunterXPPerHour := Round((Self.HunterXP * 3600000) / Runtime);
+    CookingXPPerHour := Round((Self.CookingXP * 3600000) / Runtime);
+  end
+  else
+  begin
+    XPPerHour := 0;
+    HunterXPPerHour := 0;
+    CookingXPPerHour := 0;
+  end;
+  
+  try
+    Discord.Webhook.Content := '**Session Complete!** :checkered_flag:';
+    
+    EmbedIdx := Discord.Webhook.AddEmbed();
+    Discord.Webhook.Embeds[EmbedIdx].Title := 'BigAussies Crab Trapper - Session Summary';
+    Discord.Webhook.Embeds[EmbedIdx].Color := $0000FF;
+    Discord.Webhook.Embeds[EmbedIdx].Description := 'Runtime: ' + SRL.MsToTime(Runtime, Time_Short) + LineEnding +
+                                                    'Final Level: ' + IntToStr(Stats.GetLevel(ERSSkill.HUNTER)) + LineEnding +
+                                                    'Crab Type: ' + ToStr(Self.TargetCrabType) + LineEnding +
+                                                    'Trap Count: ' + ToStr(Self.TrapCount) + LineEnding +
+                                                    'Total XP Gained: ' + FormatRoundedNumber(Self.LastXP - Self.StartXP) + LineEnding +
+                                                    'Hunter XP: ' + FormatRoundedNumber(Self.HunterXP) + ' (' + FormatRoundedNumber(HunterXPPerHour) + '/hr)' + LineEnding +
+                                                    'Cooking XP: ' + FormatRoundedNumber(Self.CookingXP) + ' (' + FormatRoundedNumber(CookingXPPerHour) + '/hr)' + LineEnding +
+                                                    'Average XP/Hour: ' + FormatRoundedNumber(XPPerHour);
+    
+    if ENABLEWORLDHOPPING then
+      Discord.Webhook.Embeds[EmbedIdx].Description += LineEnding + 'World Hops: ' + ToStr(Self.WorldHopsCompleted);
+    
+    if Discord.SendScreenshot(False) then
+      WriteLn('[Discord] Session summary sent!')
+    else
+      WriteLn('[Discord] Failed to send session summary: ' + Discord.LastError);
+  except
+    WriteLn('[Discord] Error sending session summary: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure TCrabTrapper.CheckHourlyReport();
+var
+  CurrentTime: Int64;
+begin
+  CurrentTime := GetTimeRunning();
+  
+  if (CurrentTime - Self.LastHourlyReportTime) >= 3600000 then
+  begin
+    Self.SendHourlyReport();
+    Self.LastHourlyReportTime := CurrentTime;
+  end;
+end;
+
+begin
+  Discord.Setup();
+  {$IFDEF SCRIPT_GUI}
+  Sync(@Config.Run);
+  {$ENDIF}
+  CrabTrapper.Run(WLSettings.MaxActions, WLSettings.MaxTime);
+end.

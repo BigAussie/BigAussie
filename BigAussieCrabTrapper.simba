@@ -1,4 +1,4 @@
-{$DEFINE SCRIPT_REVISION := '4'}
+{$DEFINE SCRIPT_REVISION := '5'}
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
@@ -95,7 +95,7 @@ procedure TAntiban.RandomChatTask(); override;
 begin
   Exit;
 end;
-
+                         
 procedure TAntiban.Setup(); override;
 begin
   Self.Skills := [ERSSkill.HUNTER, ERSSkill.TOTAL];
@@ -931,6 +931,7 @@ var
   XPGained, NextTrapHovered, WasFull, WasBaited: Boolean;
   WaitStartTime: UInt64;
 begin
+  WriteLn('[EMPTY_TRAP] Emptying trap at location: ' + ToStr(Location));
   TrapObj := Self.GetTrapObject(Location);
   if TrapObj = nil then
     Exit(False);
@@ -945,6 +946,12 @@ begin
   if not MainScreen.GetUpText().Contains('(full)') then
     if not WaitUntil(MainScreen.GetUpText().Contains('(full)'), 65, 9000) then
       Exit(False);
+
+  if MainScreen.GetUpText().Contains('(empty)') then
+  begin
+    WriteLn('[EMPTY_TRAP] Trap is empty, skipping');
+    Exit(False);
+  end;
   
   InitialBaitCount := Inventory.CountItemStack(BaitItem);
   TargetBaitCount := InitialBaitCount - 1;
@@ -983,15 +990,34 @@ begin
   
     if NextTrapHovered and (NextTrapIndex >= 0) and (NextTrapObj <> nil) then
     begin
-      XPBeforeClick := Self.SafeReadXPBar();
-      InitialBaitCount := Inventory.CountItemStack(BaitItem);
-      TargetBaitCount := InitialBaitCount - 1;
+      UpText := MainScreen.GetUpText();
       
-      if NextTrapObj^.Click(True, 2) then
+      if UpText.Contains('(empty)') then
       begin
-        UpText := MainScreen.GetUpText();
-        WasFull := UpText.Contains('(full)');
-        WasBaited := UpText.Contains('Baited') or UpText.Contains('baited');
+        WriteLn('[EMPTY_TRAP] Next trap has empty uptext, baiting trap instead of waiting for full');
+        if Self.BaitTrapAtLocation(Self.Traps[NextTrapIndex].Location) then
+        begin
+          if NextTrapIndex >= 0 then
+          begin
+            Self.Traps[NextTrapIndex].IsBaited := True;
+            Self.Traps[NextTrapIndex].BaitTime := GetTickCount();
+            Self.Traps[NextTrapIndex].HasCrab := False;
+            Self.LastEmptiedTrapIndex := NextTrapIndex;
+            //WriteLn('[EMPTY_TRAP] Baited trap ' + ToStr(NextTrapIndex + 1) + ' (was empty), moving to next');
+          end;
+        end;
+      end
+      else
+      begin
+        XPBeforeClick := Self.SafeReadXPBar();
+        InitialBaitCount := Inventory.CountItemStack(BaitItem);
+        TargetBaitCount := InitialBaitCount - 1;
+        
+        if NextTrapObj^.Click(True, 2) then
+        begin
+          UpText := MainScreen.GetUpText();
+          WasFull := UpText.Contains('(full)');
+          WasBaited := UpText.Contains('Baited') or UpText.Contains('baited');
         
         if WasFull then
         begin
@@ -1103,6 +1129,7 @@ begin
             end;
           end;
         end;
+        end;
       end;
     end;
   
@@ -1185,6 +1212,9 @@ var
   TrapIndex: Int32;
   TrapLocation: TPoint;
 begin
+  if Inventory.IsFull() then
+    Exit;
+  
   if not Self.HasBait() then
     TerminateScript('Out of bait');
   
@@ -1207,6 +1237,9 @@ procedure TCrabTrapper.WaitForCrabs();
 var
   I: Int32;
 begin
+  if Inventory.IsFull() then
+    Exit;
+  
   for I := 0 to High(Self.Traps) do
   begin
     if Self.Traps[I].IsBaited then
@@ -1257,6 +1290,7 @@ begin
   begin
     WriteLn('[EMPTY_TRAPS] Failed to empty trap ' + ToStr(TrapIndex + 1) + ', flag reset');
     Self.Traps[TrapIndex].HasCrab := False;
+    Self.Traps[TrapIndex].IsBaited := False;
   end;
 end;
 

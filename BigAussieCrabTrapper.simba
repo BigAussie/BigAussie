@@ -1,4 +1,4 @@
-{$DEFINE SCRIPT_REVISION := '2'}
+{$DEFINE SCRIPT_REVISION := '4'}
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
@@ -24,7 +24,8 @@ type
   
   ECrabType = (
     RED_CRAB,
-    BLUE_CRAB,
+    BLUE_CRAB_NORTH,
+    BLUE_CRAB_EAST,
     RAINBOW_CRAB
   );
   
@@ -228,7 +229,7 @@ end;
 function TCrabTrapper.GetCrabWaitTicks(CrabType: ECrabType): Int32;
 begin
   case CrabType of
-    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB: Result := 15;
+    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST: Result := 15;
     ECrabType.RAINBOW_CRAB: Result := 25;
     else Result := 15;
   end;
@@ -278,7 +279,7 @@ begin
       Map.SetupChunkEx([46, 47, 48, 45], [0]);
       WriteLn('[INIT] Loaded chunks for Red Crabs: 46, 47, 48, 45');
     end;
-    ECrabType.BLUE_CRAB:
+    ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST:
     begin
       Map.SetupChunkEx([47, 40, 52, 35], [0]);
       WriteLn('[INIT] Loaded chunks for Blue Crabs: 47, 40, 52, 35');
@@ -538,7 +539,7 @@ begin
   if WL.Activity.IsFinished() then
   begin
     WriteLn('No activity detected in 5 minutes! Shutting down.');
-    Break;
+    TerminateScript();
   end;
   
   FirstTrapWithCrab := -1;
@@ -736,10 +737,13 @@ begin
       for I := 0 to 4 do
         AllTraps += Self.RedCrabTraps[I].Coordinates;
     end;
-    ECrabType.BLUE_CRAB:
+    ECrabType.BLUE_CRAB_NORTH:
     begin
       for I := 0 to 4 do
         AllTraps += Self.BlueCrabTrapsNorth[I].Coordinates;
+    end;
+    ECrabType.BLUE_CRAB_EAST:
+    begin
       for I := 0 to 4 do
         AllTraps += Self.BlueCrabTrapsEast[I].Coordinates;
     end;
@@ -832,7 +836,7 @@ end;
 function TCrabTrapper.GetBaitItemName(): String;
 begin
   case Self.TargetCrabType of
-    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB:
+    ECrabType.RED_CRAB, ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST:
       Result := 'Fish offcuts';
     ECrabType.RAINBOW_CRAB:
       Result := 'Fine fish offcuts';
@@ -862,7 +866,7 @@ begin
           Exit(@Self.RedCrabTraps[I]);
       end;
     end;
-    ECrabType.BLUE_CRAB:
+    ECrabType.BLUE_CRAB_NORTH:
     begin
       for I := 0 to 4 do
       begin
@@ -870,6 +874,9 @@ begin
            (Self.BlueCrabTrapsNorth[I].Coordinates[0] = Location) then
           Exit(@Self.BlueCrabTrapsNorth[I]);
       end;
+    end;
+    ECrabType.BLUE_CRAB_EAST:
+    begin
       for I := 0 to 4 do
       begin
         if (Length(Self.BlueCrabTrapsEast[I].Coordinates) > 0) and 
@@ -1248,7 +1255,8 @@ begin
   end
   else
   begin
-    WriteLn('[EMPTY_TRAPS] Failed to empty trap ' + ToStr(TrapIndex + 1));
+    WriteLn('[EMPTY_TRAPS] Failed to empty trap ' + ToStr(TrapIndex + 1) + ', flag reset');
+    Self.Traps[TrapIndex].HasCrab := False;
   end;
 end;
 
@@ -1256,7 +1264,7 @@ function TCrabTrapper.GetCrabItemName(): String;
 begin
   case Self.TargetCrabType of
     ECrabType.RED_CRAB: Result := 'Red crab';
-    ECrabType.BLUE_CRAB: Result := 'Blue crab';
+    ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST: Result := 'Blue crab';
     ECrabType.RAINBOW_CRAB: Result := 'Rainbow crab';
     else Result := '';
   end;
@@ -1311,7 +1319,7 @@ var
   StoveObj: PRSObjectV2;
   I: Int32;
 begin
-  if Self.TargetCrabType = ECrabType.BLUE_CRAB then
+  if (Self.TargetCrabType = ECrabType.BLUE_CRAB_NORTH) or (Self.TargetCrabType = ECrabType.BLUE_CRAB_EAST) then
     Exit(False);
   
   case Self.TargetCrabType of
@@ -1361,7 +1369,7 @@ var
 begin
   case Self.TargetCrabType of
     ECrabType.RED_CRAB: CookedCrabItem := 'Red crab meat';
-    ECrabType.BLUE_CRAB: CookedCrabItem := 'Blue crab meat';
+    ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST: CookedCrabItem := 'Blue crab meat';
     ECrabType.RAINBOW_CRAB: CookedCrabItem := 'Rainbow crab meat';
     else Exit(False);
   end;
@@ -1454,7 +1462,7 @@ begin
   case Self.TargetCrabType of
     ECrabType.RED_CRAB: CookedCrabItem := 'Red crab meat';
     ECrabType.RAINBOW_CRAB: CookedCrabItem := 'Rainbow crab meat';
-    ECrabType.BLUE_CRAB: CookedCrabItem := '';
+    ECrabType.BLUE_CRAB_NORTH, ECrabType.BLUE_CRAB_EAST: CookedCrabItem := '';
   end;
   
   if (CookedCrabItem <> '') and Inventory.ContainsItem(CookedCrabItem) then
@@ -1463,6 +1471,10 @@ begin
       Self.BankCookedCrabs()
     else
       Self.DropItem(CookedCrabItem);
+    
+    if Inventory.ContainsItem('Burnt crab meat') then
+      Self.DropItem('Burnt crab meat');
+    
     Exit;
   end;
   
@@ -1491,9 +1503,12 @@ begin
                 ECrabType.RAINBOW_CRAB: Self.DropItem('Rainbow crab meat');
               end;
             end;
+            
+            if Inventory.ContainsItem('Burnt crab meat') then
+              Self.DropItem('Burnt crab meat');
           end;
         end
-        else if Self.TargetCrabType = ECrabType.BLUE_CRAB then
+        else if (Self.TargetCrabType = ECrabType.BLUE_CRAB_NORTH) or (Self.TargetCrabType = ECrabType.BLUE_CRAB_EAST) then
         begin
           if Inventory.ContainsItem('Raw blue crab') then
           begin
@@ -1654,6 +1669,17 @@ begin
     Self.WorldHopIntervalInput.SetVisible(Self.EnableWorldHoppingCheckBox.IsChecked());
 end;
 
+procedure TConfig.CrabTypeComboBoxChanged({$H-}sender: TObject){$H+};
+var
+  SelectedIndex: Int32;
+begin
+  if Assigned(Self.CrabTypeComboBox) and Assigned(Self.UseBankForRedCrabsCheckBox) then
+  begin
+    SelectedIndex := Self.CrabTypeComboBox.GetItemIndex();
+    Self.UseBankForRedCrabsCheckBox.SetVisible(SelectedIndex = 0);
+  end;
+end;
+
 procedure TConfig.LoadUserSettings();
 var
   SavedCrabType: Int32;
@@ -1685,10 +1711,11 @@ begin
 
   if Assigned(Self.CrabTypeComboBox) then
   begin
-    if (SavedCrabType >= 0) and (SavedCrabType <= 2) then
+    if (SavedCrabType >= 0) and (SavedCrabType <= 3) then
       Self.CrabTypeComboBox.SetItemIndex(SavedCrabType)
     else
       Self.CrabTypeComboBox.SetItemIndex(0);
+    Self.CrabTypeComboBoxChanged(Self.CrabTypeComboBox.ComboBox);
   end;
 
   if Assigned(Self.TrapCountComboBox) then
@@ -1802,8 +1829,9 @@ begin
   begin
     case Self.CrabTypeComboBox.GetItemIndex() of
       0: SELECTEDCRABTYPE := ECrabType.RED_CRAB;
-      1: SELECTEDCRABTYPE := ECrabType.BLUE_CRAB;
-      2: SELECTEDCRABTYPE := ECrabType.RAINBOW_CRAB;
+      1: SELECTEDCRABTYPE := ECrabType.BLUE_CRAB_NORTH;
+      2: SELECTEDCRABTYPE := ECrabType.BLUE_CRAB_EAST;
+      3: SELECTEDCRABTYPE := ECrabType.RAINBOW_CRAB;
       else SELECTEDCRABTYPE := ECrabType.RED_CRAB;
     end;
   end;
@@ -1882,12 +1910,13 @@ begin
     SetTop(TControl.AdjustToDPI(140));
     SetWidth(TControl.AdjustToDPI(200));
     SetStyle(csDropDownList);
-    AddItemArray(['Red Crab', 'Blue Crab', 'Rainbow Crab']);
-    if (SavedCrabType >= 0) and (SavedCrabType <= 2) then
+    AddItemArray(['Red Crab', 'Blue Crab North', 'Blue Crab East', 'Rainbow Crab']);
+    if (SavedCrabType >= 0) and (SavedCrabType <= 3) then
       SetItemIndex(SavedCrabType)
     else
       SetItemIndex(0);
     SetHint('Select which type of crab to trap');
+    ComboBox.SetOnChange(@CrabTypeComboBoxChanged);
   end;
   
   with Self.TrapCountComboBox do
@@ -1914,6 +1943,7 @@ begin
     SetTop(TControl.AdjustToDPI(185));
     SetChecked(SavedUseBankForRedCrabs);
     SetHint('If enabled, will bank cooked red crabs instead of dropping them');
+    SetVisible(SavedCrabType = 0);
   end;
   
   with Self.EnableWorldHoppingCheckBox do

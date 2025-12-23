@@ -1,8 +1,11 @@
-{$DEFINE SCRIPT_REVISION := '5'}
+{$DEFINE SCRIPT_REVISION := '7'}
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
 {$I WaspLib/optional/handlers/discord.simba}
+
+{Add Do.AntiBan Sleeps/Breaks
+Add Logging in check}
 
 const
   TRAP_CRAB_CAUGHT_BUFFER = 2000;
@@ -616,11 +619,10 @@ begin
   end;
 end;
 
-procedure TCrabTrapper.DrawUIOverlay(drawBox: TBox; title, status, runtime: String);
+procedure TCrabTrapper.DrawUIOverlay(drawBox: TBox; title, status, runtime, totalXPPerHour, totalXP: String);
 var
   yPos: Int32;
 begin
-  {$IFNDEF SRL_DISABLE_REMOTEINPUT}
   RSClient.Image().DrawBoxFilled(drawBox, False, $2D2D30);
   RSClient.Image().DrawBoxFilled(drawBox.Expand(1), False, $FFFFFF);
   RSClient.Image().DrawBoxFilled(drawBox, False, $2D2D30);
@@ -639,20 +641,37 @@ begin
   yPos += 12;
   RSClient.Image().DrawText('Runtime: ' + runtime, Point(drawBox.X1 + 3, yPos), $FFFFFF);
   yPos += 12;
-  {$ENDIF}
+  RSClient.Image().DrawText('Total XP/H: ' + totalXPPerHour, Point(drawBox.X1 + 3, yPos), $FFFFFF);
+  yPos += 12;
+  RSClient.Image().DrawText('Total XP: ' + totalXP, Point(drawBox.X1 + 3, yPos), $FFFFFF);
+  yPos += 12;
 end;
 
 procedure TCrabTrapper.DrawStatusDisplay();
 var
   statusBox: TBox;
   currentActivity, runtime: String;
+  TotalXPGained: Int32;
+  XPPerHour: Int32;
+  RuntimeMs: UInt64;
+  totalXPPerHourStr, totalXPStr: String;
 begin
-  statusBox := Box(10, 260, 150, 320);
+  statusBox := Box(10, 260, 170, 330);
 
   currentActivity := Self.GetCurrentActivity();
-  runtime := SRL.MsToTime(GetTimeRunning(), Time_Short);
+  RuntimeMs := GetTimeRunning();
+  runtime := SRL.MsToTime(RuntimeMs, Time_Short);
+  
+  TotalXPGained := Self.LastXP - Self.StartXP;
+  if RuntimeMs > 0 then
+    XPPerHour := Round((TotalXPGained * 3600000) / RuntimeMs)
+  else
+    XPPerHour := 0;
+  
+  totalXPPerHourStr := FormatRoundedNumber(XPPerHour);
+  totalXPStr := FormatRoundedNumber(TotalXPGained);
 
-  Self.DrawUIOverlay(statusBox, 'BigAussie''s Crab Trapper', currentActivity, runtime);
+  Self.DrawUIOverlay(statusBox, 'BigAussie''s Crab Trapper', currentActivity, runtime, totalXPPerHourStr, totalXPStr);
 end;
 
 procedure TCrabTrapper.Report();
@@ -1591,16 +1610,6 @@ begin
       ECrabTrapState.END_SCRIPT: Break;
     end;
     
-    if (GetTickCount() - Self.LastImageClear) >= 30000 then
-    begin
-      try
-        RSClient.Image.Clear;
-      except
-      end;
-      Self.DrawStatusDisplay();
-      Self.LastImageClear := GetTickCount();
-    end;
-    
     if (GetTimeRunning() mod 1000) < 500 then
       Self.DrawStatusDisplay();
     
@@ -2122,6 +2131,7 @@ var
   EmbedIdx: Int32;
   XPPerHour, HunterXPPerHour, CookingXPPerHour: Int32;
   Runtime: UInt64;
+  CookingXPStr: String;
 begin
   if not SENDHOURLYREPORTMSG then Exit;
   
@@ -2140,6 +2150,11 @@ begin
   end;
   
   try
+    if Self.CookingXP > 0 then
+      CookingXPStr := 'Cooking XP: ' + FormatRoundedNumber(Self.CookingXP) + ' (' + FormatRoundedNumber(CookingXPPerHour) + '/hr)' + LineEnding
+    else
+      CookingXPStr := 'Cooking XP: ' + FormatRoundedNumber(Self.CookingXP) + LineEnding;
+    
     Discord.Webhook.Content := '**Hourly Progress Report** :chart_with_upwards_trend:';
     
     EmbedIdx := Discord.Webhook.AddEmbed();
@@ -2150,7 +2165,7 @@ begin
                                                     'Trap Count: ' + ToStr(Self.TrapCount) + LineEnding +
                                                     'Total XP Gained: ' + FormatRoundedNumber(Self.LastXP - Self.StartXP) + LineEnding +
                                                     'Hunter XP: ' + FormatRoundedNumber(Self.HunterXP) + ' (' + FormatRoundedNumber(HunterXPPerHour) + '/hr)' + LineEnding +
-                                                    'Cooking XP: ' + FormatRoundedNumber(Self.CookingXP) + ' (' + FormatRoundedNumber(CookingXPPerHour) + '/hr)' + LineEnding +
+                                                    CookingXPStr +
                                                     'Total XP/Hour: ' + FormatRoundedNumber(XPPerHour);
     
     if Discord.Send() then

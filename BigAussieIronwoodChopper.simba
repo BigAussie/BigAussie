@@ -9,6 +9,15 @@ var
   ENABLEWEBHOOKS: Boolean = False;
   SENDHOURLYREPORTMSG: Boolean = True;
   SENDSESSIONSUMMARYMSG: Boolean = True;
+  
+  // World Hopping Settings
+  ENABLEWORLDHOPPING: Boolean = False;
+  WORLDHOPINTERVAL: Integer = 45;
+  
+  // Custom Break Settings
+  OVERRIDEBREAKS: Boolean = False;
+  CUSTOMBREAKINTERVAL: Integer = 60;
+  CUSTOMBREAKDURATION: Integer = 5;
 
 type
   EIronwoodState = (
@@ -43,6 +52,12 @@ type
     LastHourlyReportTime: UInt64;
     LastLevel: Int32;
     CurrentLevel: Int32;
+    
+    // World Hopping
+    WorldHopTimer: TCountDown;
+    NextWorldHopTime: UInt64;
+    WorldHopsCompleted: Int32;
+    LastWorldHopTime: Int64;
   end;
 
 var
@@ -158,6 +173,25 @@ begin
   Self.MaxZoom := 30;
 
   inherited;
+  
+  if OVERRIDEBREAKS then
+  begin
+    WriteLn('[ANTIBAN] Custom break override enabled:');
+    WriteLn('  - Break Interval: ', CUSTOMBREAKINTERVAL, ' minutes');
+    WriteLn('  - Break Duration: ', CUSTOMBREAKDURATION, ' minutes');
+    
+    // Clear the default breaks so we can use our own
+    Self.Breaks := [];
+    
+    // now we add our custom breaks
+    Self.AddBreak(CUSTOMBREAKINTERVAL * ONE_MINUTE, CUSTOMBREAKDURATION * ONE_MINUTE, 0.33, 0.15);
+    
+    WriteLn('[ANTIBAN] Custom breaks initialized successfully');
+  end
+  else
+  begin
+    WriteLn('[ANTIBAN] Using WaspLib break system');
+  end;
 end;
 
 function FormatRoundedNumber(Number: Int64): String;
@@ -168,6 +202,125 @@ begin
     Result := FormatFloat('0K', Number / 1000)
   else
     Result := SRL.FormatNumber(Number);
+end;
+
+// ============================================================================
+// World Hopping Functions
+// ============================================================================
+function TIronwoodChopper.GetRandomWorldHopTime(): UInt64;
+var
+  BaseInterval: UInt64;
+  RandomVariation: Integer;
+begin
+  BaseInterval := WORLDHOPINTERVAL * 60000;
+  
+  // 10% random variation to the interval either side
+  RandomVariation := Random(-10, 11);
+  Result := Round(BaseInterval * (1.0 + (RandomVariation / 100.0)));
+  
+  WriteLn('Next world hop scheduled in: ' + SRL.MsToTime(Result, Time_Short) +
+          ' (Base: ' + IntToStr(WORLDHOPINTERVAL) + 'min, Variation: ' + IntToStr(RandomVariation) + '%)');
+end;
+
+function TIronwoodChopper.GetWorldHopTimeRange(): String;
+var
+  MinTime, MaxTime: Integer;
+begin
+  MinTime := Round(WORLDHOPINTERVAL * 0.9);
+  MaxTime := Round(WORLDHOPINTERVAL * 1.1);
+  Result := IntToStr(MinTime) + '-' + IntToStr(MaxTime) + ' min';
+end;
+
+procedure TIronwoodChopper.SetupWorldHopping();
+begin
+  writeln('Setting up world hopping...');
+  
+  if not ENABLEWORLDHOPPING then
+  begin
+    writeln('World hopping is disabled.');
+    Exit;
+  end;
+  
+  if Length(Login.Players[Login.PlayerIndex].Worlds) < 2 then
+  begin
+    writeln('ERROR: Need at least 2 worlds in player setup for world hopping!');
+    writeln('Disabling world hopping.');
+    ENABLEWORLDHOPPING := False;
+    Exit;
+  end;
+  
+  Self.NextWorldHopTime := GetTickCount() + Self.GetRandomWorldHopTime();
+  writeln('World hopping enabled. Next hop in: ' + SRL.MsToTime(Self.NextWorldHopTime - GetTickCount(), Time_Short));
+end;
+
+function TIronwoodChopper.ShouldHopWorld(): Boolean;
+begin
+  if not ENABLEWORLDHOPPING then
+    Exit(False);
+    
+  Result := GetTickCount() >= Self.NextWorldHopTime;
+end;
+
+procedure TIronwoodChopper.DoWorldHop();
+var
+  currentWorld: Int32;
+  targetWorld: Int32;
+  availableWorlds: TIntegerArray;
+  playerWorlds: TIntegerArray;
+  i: Int32;
+begin
+  if not ENABLEWORLDHOPPING then
+    Exit;
+  
+  WriteLn('Attempting world hop...');
+  
+  if not Logout.Open() then
+  begin
+    writeln('Failed to open logout menu');
+    Self.NextWorldHopTime := GetTickCount() + 120000;
+    Exit;
+  end;
+  
+  if Logout.GetButton(ERSLogoutButton.WORLD_SWITCHER).Visible() then
+    Logout.GetButton(ERSLogoutButton.WORLD_SWITCHER).Click(MOUSE_LEFT);
+  
+  WaitUntil((currentWorld := WorldHopper.GetCurrentWorld()) <> 0, 200, 12000);
+  
+  writeln('Current world: ' + ToStr(currentWorld));
+  
+  playerWorlds := Login.Players[Login.PlayerIndex].Worlds;
+  
+  for i := 0 to High(playerWorlds) do
+  begin
+    if playerWorlds[i] <> currentWorld then
+      availableWorlds += playerWorlds[i];
+  end;
+  
+  if Length(availableWorlds) = 0 then
+  begin
+    writeln('No other worlds available to hop to, disabling world hopping!');
+    ENABLEWORLDHOPPING := False;
+    Exit;
+  end;
+  
+  targetWorld := availableWorlds[Random(Length(availableWorlds))];
+  writeln('Randomly selected target world: ' + ToStr(targetWorld));
+  
+  if WorldHopper.Hop([targetWorld]) then
+  begin
+    writeln('Successfully hopped to world ' + ToStr(targetWorld) + '!');
+    
+    Inc(Self.WorldHopsCompleted);
+    Self.LastWorldHopTime := GetTickCount();
+    
+    Self.NextWorldHopTime := GetTickCount() + Self.GetRandomWorldHopTime();
+    writeln('Next world hop in: ' + SRL.MsToTime(Self.NextWorldHopTime - GetTickCount(), Time_Short));
+  end
+  else
+  begin
+    writeln('World hop to ' + ToStr(targetWorld) + ' failed, trying again in 2 minutes');
+    Self.NextWorldHopTime := GetTickCount() + 120000;
+  end;
 end;
 
 procedure TIronwoodChopper.SetupObjects();
@@ -322,6 +475,10 @@ begin
   Self.LastHourlyReportTime := GetTickCount();
   Self.CurrentLevel := Stats.GetLevel(ERSSkill.WOODCUTTING);
   Self.LastLevel := Self.CurrentLevel;
+  
+  Self.WorldHopsCompleted := 0;
+  Self.LastWorldHopTime := 0;
+  Self.SetupWorldHopping();
 
   if ENABLEWEBHOOKS then
     AddOnTerminate(@Self.SendTerminationNotification);
@@ -690,6 +847,18 @@ begin
   WriteLn(' Logs/hr: ' + ToStr(LogsPerHour));
   WriteLn(' Profit: ' + FormatRoundedNumber(Profit));
   WriteLn(' Profit/hr: ' + FormatRoundedNumber(ProfitPerHour));
+  
+  if ENABLEWORLDHOPPING then
+  begin
+    WriteLn(' ');
+    WriteLn(' World Hopping: ENABLED (' + Self.GetWorldHopTimeRange() + ')');
+    WriteLn(' Hops Completed: ' + IntToStr(Self.WorldHopsCompleted));
+    if Self.NextWorldHopTime > GetTickCount() then
+      WriteLn(' Next Hop: ' + SRL.MsToTime(Self.NextWorldHopTime - GetTickCount(), Time_Short))
+    else
+      WriteLn(' Next Hop: READY!');
+  end;
+  
   WriteLn('========================================');
 end;
 
@@ -803,6 +972,13 @@ begin
 
     Self.State := Self.GetState();
     Self.SetAction(ToStr(Self.State));
+    
+    // Check for world hop (only when not actively chopping)
+    if Self.ShouldHopWorld() and (Self.State <> EIronwoodState.WAIT_CHOPPING) then
+    begin
+      Self.DoWorldHop();
+      Continue;
+    end;
 
     case Self.State of
       EIronwoodState.CHOP_TREE: Self.ChopTree();
@@ -844,6 +1020,13 @@ type
     SessionSummaryCheckBox: TLabeledCheckBox;
     WebhookInfo: TLabel;
     TestButton: TButton;
+    
+    EnableWorldHoppingCheckBox: TLabeledCheckBox;
+    WorldHopIntervalInput: TLabeledEdit;
+    
+    OverrideBreaksCheckBox: TLabeledCheckBox;
+    CustomBreakIntervalInput: TLabeledEdit;
+    CustomBreakDurationInput: TLabeledEdit;
   end;
 
 procedure TConfig.StartScript(sender: TObject); override;
@@ -859,11 +1042,31 @@ begin
   ENABLEWEBHOOKS := Self.EnableWebhooksCheckBox.IsChecked();
   SENDHOURLYREPORTMSG := Self.HourlyReportsCheckBox.IsChecked();
   SENDSESSIONSUMMARYMSG := Self.SessionSummaryCheckBox.IsChecked();
+  
+  if Assigned(Self.EnableWorldHoppingCheckBox) then
+    ENABLEWORLDHOPPING := Self.EnableWorldHoppingCheckBox.IsChecked();
+  
+  if Assigned(Self.WorldHopIntervalInput) then
+    WORLDHOPINTERVAL := StrToIntDef(Self.WorldHopIntervalInput.GetText(), 45);
+  
+  if Assigned(Self.OverrideBreaksCheckBox) then
+    OVERRIDEBREAKS := Self.OverrideBreaksCheckBox.IsChecked();
+  
+  if Assigned(Self.CustomBreakIntervalInput) then
+    CUSTOMBREAKINTERVAL := StrToIntDef(Self.CustomBreakIntervalInput.GetText(), 60);
+  
+  if Assigned(Self.CustomBreakDurationInput) then
+    CUSTOMBREAKDURATION := StrToIntDef(Self.CustomBreakDurationInput.GetText(), 5);
 
   WriteINI(Username + ' Ironwood Webhook Settings', 'WebhookURL', WEBHOOKURL, 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Webhook Settings', 'EnableWebhooks', BoolToStr(ENABLEWEBHOOKS, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Webhook Settings', 'HourlyReports', BoolToStr(SENDHOURLYREPORTMSG, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Webhook Settings', 'SessionSummary', BoolToStr(SENDSESSIONSUMMARYMSG, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Script Settings', 'EnableWorldHopping', BoolToStr(ENABLEWORLDHOPPING, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Script Settings', 'WorldHopInterval', IntToStr(WORLDHOPINTERVAL), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Antiban Manager', 'OverrideBreaks', BoolToStr(OVERRIDEBREAKS, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Antiban Manager', 'CustomBreakInterval', IntToStr(CUSTOMBREAKINTERVAL), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Antiban Manager', 'CustomBreakDuration', IntToStr(CUSTOMBREAKDURATION), 'Configs/BAIronwoodSettings.ini');
 
   Discord.SetWebhook(WEBHOOKURL);
 
@@ -881,6 +1084,20 @@ begin
   Self.HourlyReportsCheckBox.SetVisible(VisibleState);
   Self.SessionSummaryCheckBox.SetVisible(VisibleState);
   Self.WebhookInfo.SetVisible(VisibleState);
+end;
+
+procedure TConfig.WorldHopCheckboxChanged({$H-}sender: TObject){$H+};
+begin
+  if Assigned(Self.WorldHopIntervalInput) then
+    Self.WorldHopIntervalInput.SetVisible(Self.EnableWorldHoppingCheckBox.IsChecked());
+end;
+
+procedure TConfig.OverrideBreaksCheckboxChanged({$H-}sender: TObject){$H+};
+begin
+  if Assigned(Self.CustomBreakIntervalInput) then
+    Self.CustomBreakIntervalInput.SetVisible(Self.OverrideBreaksCheckBox.IsChecked());
+  if Assigned(Self.CustomBreakDurationInput) then
+    Self.CustomBreakDurationInput.SetVisible(Self.OverrideBreaksCheckBox.IsChecked());
 end;
 
 procedure TConfig.OpenURL(Sender: TObject);
@@ -913,6 +1130,10 @@ var
   SavedEnableWebhooks: Boolean;
   SavedHourly: Boolean;
   SavedSessionSummary: Boolean;
+  SavedEnableWorldHopping: Boolean;
+  SavedWorldHopInterval: Integer;
+  SavedOverrideBreaks: Boolean;
+  SavedCustomBreakInterval, SavedCustomBreakDuration: Integer;
 begin
   Self.Setup('BigAussies Ironwood Chopper');
   Self.Start.SetOnClick(@Self.StartScript);
@@ -933,13 +1154,41 @@ begin
   SavedEnableWebhooks := StrToBoolDef(ReadINI(Username + ' Ironwood Webhook Settings', 'EnableWebhooks', 'Configs/BAIronwoodSettings.ini'), False);
   SavedHourly := StrToBoolDef(ReadINI(Username + ' Ironwood Webhook Settings', 'HourlyReports', 'Configs/BAIronwoodSettings.ini'), True);
   SavedSessionSummary := StrToBoolDef(ReadINI(Username + ' Ironwood Webhook Settings', 'SessionSummary', 'Configs/BAIronwoodSettings.ini'), True);
+  SavedEnableWorldHopping := StrToBoolDef(ReadINI(Username + ' Ironwood Script Settings', 'EnableWorldHopping', 'Configs/BAIronwoodSettings.ini'), False);
+  SavedWorldHopInterval := StrToIntDef(ReadINI(Username + ' Ironwood Script Settings', 'WorldHopInterval', 'Configs/BAIronwoodSettings.ini'), 45);
+  SavedOverrideBreaks := StrToBoolDef(ReadINI(Username + ' Ironwood Antiban Manager', 'OverrideBreaks', 'Configs/BAIronwoodSettings.ini'), False);
+  SavedCustomBreakInterval := StrToIntDef(ReadINI(Username + ' Ironwood Antiban Manager', 'CustomBreakInterval', 'Configs/BAIronwoodSettings.ini'), 60);
+  SavedCustomBreakDuration := StrToIntDef(ReadINI(Username + ' Ironwood Antiban Manager', 'CustomBreakDuration', 'Configs/BAIronwoodSettings.ini'), 5);
+
+  with Self.EnableWorldHoppingCheckBox do
+  begin
+    Create(tab);
+    SetCaption('Enable World Hopping');
+    SetLeft(TControl.AdjustToDPI(40));
+    SetTop(TControl.AdjustToDPI(140));
+    SetChecked(SavedEnableWorldHopping);
+    SetHint('Hop worlds at random intervals. Requires at least 2 worlds in player setup.');
+    CheckBox.SetOnChange(@Self.WorldHopCheckboxChanged);
+  end;
+  
+  with Self.WorldHopIntervalInput do
+  begin
+    Create(tab);
+    SetCaption('World Hop Interval (minutes)');
+    SetLeft(Self.EnableWorldHoppingCheckBox.GetLeft());
+    SetTop(Self.EnableWorldHoppingCheckBox.GetTop() + TControl.AdjustToDPI(30));
+    SetWidth(TControl.AdjustToDPI(155));
+    SetText(IntToStr(SavedWorldHopInterval));
+    SetHint('How often to hop worlds in minutes (±10% random variation)');
+    Edit.SetOnKeyPress(@Edit.NumberField);
+  end;
 
   with Self.EnableWebhooksCheckBox do
   begin
     Create(tab);
     SetCaption('Enable Discord Notifications');
     SetLeft(TControl.AdjustToDPI(40));
-    SetTop(TControl.AdjustToDPI(200));
+    SetTop(Self.WorldHopIntervalInput.GetTop() + TControl.AdjustToDPI(45));
     SetChecked(SavedEnableWebhooks);
     CheckBox.SetOnChange(@Self.WebhooksCheckboxChanged);
   end;
@@ -994,6 +1243,52 @@ begin
   end;
 
   Self.WebhooksCheckboxChanged(Self.EnableWebhooksCheckBox.CheckBox);
+  Self.WorldHopCheckboxChanged(nil);
+  
+  for tab in Self.Tabs do
+  begin
+    if tab.GetCaption() = 'Antiban Manager' then
+    begin
+      with Self.OverrideBreaksCheckBox do
+      begin
+        Create(tab);
+        SetCaption('Override Default Breaks');
+        SetLeft(TControl.AdjustToDPI(90));
+        SetTop(TControl.AdjustToDPI(220));
+        SetChecked(SavedOverrideBreaks);
+        SetHint('Override the default WaspLib break intervals with custom settings.');
+        CheckBox.SetOnChange(@OverrideBreaksCheckboxChanged);
+      end;
+      
+      with Self.CustomBreakIntervalInput do
+      begin
+        Create(tab);
+        SetCaption('Break Interval (minutes)');
+        SetLeft(TControl.AdjustToDPI(90));
+        SetTop(TControl.AdjustToDPI(240));
+        SetWidth(TControl.AdjustToDPI(160));
+        SetText(IntToStr(SavedCustomBreakInterval));
+        SetHint('How often to take breaks (e.g., 60 = every hour). Includes 25% randomness.');
+        Edit.SetOnKeyPress(@Edit.NumberField);
+      end;
+      
+      with Self.CustomBreakDurationInput do
+      begin
+        Create(tab);
+        SetCaption('Break Duration (minutes)');
+        SetLeft(TControl.AdjustToDPI(270));
+        SetTop(TControl.AdjustToDPI(240));
+        SetWidth(TControl.AdjustToDPI(160));
+        SetText(IntToStr(SavedCustomBreakDuration));
+        SetHint('How long breaks should last (e.g., 5 = 5 minute break). Includes 33% randomness.');
+        Edit.SetOnKeyPress(@Edit.NumberField);
+      end;
+      
+      Break;
+    end;
+  end;
+  
+  Self.OverrideBreaksCheckboxChanged(nil);
 
   inherited;
 end;

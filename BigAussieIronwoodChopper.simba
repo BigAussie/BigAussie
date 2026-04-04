@@ -1,4 +1,4 @@
-{$DEFINE SCRIPT_REVISION := '2'}
+{$DEFINE SCRIPT_REVISION := '3'}
 {$IFDEF WINDOWS}{$DEFINE SCRIPT_GUI}{$ENDIF}
 {$I SRL-T/osr.simba}
 {$I WaspLib/osr.simba}
@@ -18,6 +18,10 @@ var
   OVERRIDEBREAKS: Boolean = False;
   CUSTOMBREAKINTERVAL: Integer = 60;
   CUSTOMBREAKDURATION: Integer = 5;
+
+  // Forestry / Player Preference
+  PREFERPOPULATEDTREES: Boolean = True;
+  PLAYER_DETECT_RADIUS: Int32 = 25;
 
 type
   EIronwoodState = (
@@ -63,9 +67,6 @@ type
 var
   Discord: TDiscordClient;
 
-// ============================================================================
-// Constants
-// ============================================================================
 const
   // Sneaky weight bias here because const roughly 35% chance to do the 1st array tree, the closest to the bank (17% for the others)
   TREE_WEIGHT_BIAS: array[0..6] of Int32 = [5, 10, 1, 1, 1, 5, 5];
@@ -126,9 +127,6 @@ const
     73
   ];
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
 // MM2MS Fix backported by Bootie from Tor shit
 function TMM2MSProjector.Run(Coords: Vector3Array; Rotation: Vector3): TPointArray; override;
 var
@@ -204,9 +202,6 @@ begin
     Result := SRL.FormatNumber(Number);
 end;
 
-// ============================================================================
-// World Hopping Functions
-// ============================================================================
 function TIronwoodChopper.GetRandomWorldHopTime(): UInt64;
 var
   BaseInterval: UInt64;
@@ -359,13 +354,88 @@ begin
   WriteLn('[OBJECTS] Objects Setup.');
 end;
 
+procedure TIronwoodChopper.CountPlayersNearTrees(var Counts: TIntegerArray);
+var
+  PlayerDots: TPointArray;
+  TreeMM: TPoint;
+  I, J: Int32;
+  Dist: Double;
+begin
+  SetLength(Counts, 7);
+  for I := 0 to 6 do
+    Counts[I] := 0;
+
+  PlayerDots := Minimap.GetDots(ERSMinimapDot.PLAYER);
+  if Length(PlayerDots) = 0 then
+    Exit;
+
+  for I := 0 to 6 do
+  begin
+    TreeMM := Map.Map2MM(Self.IronwoodTrees[I].Coordinates[0]);
+
+    if not Minimap.Bounds.Contains(TreeMM) then
+      Continue;
+
+    for J := 0 to High(PlayerDots) do
+    begin
+      Dist := TreeMM.DistanceTo(PlayerDots[J]);
+      if Dist <= PLAYER_DETECT_RADIUS then
+        Inc(Counts[I]);
+    end;
+  end;
+end;
+
 function TIronwoodChopper.GetWeightedTreeIndex(ExcludeIndex: Int32): Int32;
 var
   I: Int32;
   TotalWeight: Int32;
   Roll: Int32;
   EffectiveBias: Int32;
+  PlayerCounts: TIntegerArray;
+  BestPlayerCount: Int32;
+  BestTreeIndex: Int32;
+  CandidateCount: Int32;
+  Candidates: array[0..6] of Int32;
 begin
+  if PREFERPOPULATEDTREES then
+  begin
+    Self.CountPlayersNearTrees(PlayerCounts);
+
+    BestPlayerCount := 0;
+    for I := 0 to 6 do
+    begin
+      if (ExcludeIndex <> -1) and (I = ExcludeIndex) then
+        Continue;
+      if PlayerCounts[I] > BestPlayerCount then
+        BestPlayerCount := PlayerCounts[I];
+    end;
+
+    if BestPlayerCount > 0 then
+    begin
+      WriteLn('[FORESTRY] Player counts per tree: ',
+        PlayerCounts[0], ', ', PlayerCounts[1], ', ', PlayerCounts[2], ', ',
+        PlayerCounts[3], ', ', PlayerCounts[4], ', ', PlayerCounts[5], ', ',
+        PlayerCounts[6]);
+
+      CandidateCount := 0;
+      for I := 0 to 6 do
+      begin
+        if (ExcludeIndex <> -1) and (I = ExcludeIndex) then
+          Continue;
+        if PlayerCounts[I] = BestPlayerCount then
+        begin
+          Candidates[CandidateCount] := I;
+          Inc(CandidateCount);
+        end;
+      end;
+
+      BestTreeIndex := Candidates[Random(CandidateCount)];
+      WriteLn('[FORESTRY] Chose tree ', BestTreeIndex, ' (', BestPlayerCount, ' players nearby)');
+      Result := BestTreeIndex;
+      Exit;
+    end;
+  end;
+
   if Random(100) < 15 then
   begin
     repeat
@@ -488,6 +558,11 @@ begin
     WriteLn('[FAILSAFE] ERROR: You are not using the FIXED CLASSIC screen mode. FIXED CLASSIC mode is the only supported mode for this script.');
     TerminateScript('Screen mode not supported');
   end;
+
+  if PREFERPOPULATEDTREES then
+    WriteLn('[IRONWOOD] Forestry mode: ENABLED - will prefer trees with other players')
+  else
+    WriteLn('[IRONWOOD] Forestry mode: DISABLED - using standard tree weights');
 
   WriteLn('[IRONWOOD] Starting on tree: ', Self.CurrentTreeIndex);
 end;
@@ -1024,6 +1099,8 @@ type
     EnableWorldHoppingCheckBox: TLabeledCheckBox;
     WorldHopIntervalInput: TLabeledEdit;
     
+    PreferPopulatedTreesCheckBox: TLabeledCheckBox;
+    
     OverrideBreaksCheckBox: TLabeledCheckBox;
     CustomBreakIntervalInput: TLabeledEdit;
     CustomBreakDurationInput: TLabeledEdit;
@@ -1049,6 +1126,9 @@ begin
   if Assigned(Self.WorldHopIntervalInput) then
     WORLDHOPINTERVAL := StrToIntDef(Self.WorldHopIntervalInput.GetText(), 45);
   
+  if Assigned(Self.PreferPopulatedTreesCheckBox) then
+    PREFERPOPULATEDTREES := Self.PreferPopulatedTreesCheckBox.IsChecked();
+  
   if Assigned(Self.OverrideBreaksCheckBox) then
     OVERRIDEBREAKS := Self.OverrideBreaksCheckBox.IsChecked();
   
@@ -1064,6 +1144,7 @@ begin
   WriteINI(Username + ' Ironwood Webhook Settings', 'SessionSummary', BoolToStr(SENDSESSIONSUMMARYMSG, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Script Settings', 'EnableWorldHopping', BoolToStr(ENABLEWORLDHOPPING, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Script Settings', 'WorldHopInterval', IntToStr(WORLDHOPINTERVAL), 'Configs/BAIronwoodSettings.ini');
+  WriteINI(Username + ' Ironwood Script Settings', 'PreferPopulatedTrees', BoolToStr(PREFERPOPULATEDTREES, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Antiban Manager', 'OverrideBreaks', BoolToStr(OVERRIDEBREAKS, 'true', 'false'), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Antiban Manager', 'CustomBreakInterval', IntToStr(CUSTOMBREAKINTERVAL), 'Configs/BAIronwoodSettings.ini');
   WriteINI(Username + ' Ironwood Antiban Manager', 'CustomBreakDuration', IntToStr(CUSTOMBREAKDURATION), 'Configs/BAIronwoodSettings.ini');
@@ -1132,6 +1213,7 @@ var
   SavedSessionSummary: Boolean;
   SavedEnableWorldHopping: Boolean;
   SavedWorldHopInterval: Integer;
+  SavedPreferPopulatedTrees: Boolean;
   SavedOverrideBreaks: Boolean;
   SavedCustomBreakInterval, SavedCustomBreakDuration: Integer;
 begin
@@ -1156,6 +1238,7 @@ begin
   SavedSessionSummary := StrToBoolDef(ReadINI(Username + ' Ironwood Webhook Settings', 'SessionSummary', 'Configs/BAIronwoodSettings.ini'), True);
   SavedEnableWorldHopping := StrToBoolDef(ReadINI(Username + ' Ironwood Script Settings', 'EnableWorldHopping', 'Configs/BAIronwoodSettings.ini'), False);
   SavedWorldHopInterval := StrToIntDef(ReadINI(Username + ' Ironwood Script Settings', 'WorldHopInterval', 'Configs/BAIronwoodSettings.ini'), 45);
+  SavedPreferPopulatedTrees := StrToBoolDef(ReadINI(Username + ' Ironwood Script Settings', 'PreferPopulatedTrees', 'Configs/BAIronwoodSettings.ini'), True);
   SavedOverrideBreaks := StrToBoolDef(ReadINI(Username + ' Ironwood Antiban Manager', 'OverrideBreaks', 'Configs/BAIronwoodSettings.ini'), False);
   SavedCustomBreakInterval := StrToIntDef(ReadINI(Username + ' Ironwood Antiban Manager', 'CustomBreakInterval', 'Configs/BAIronwoodSettings.ini'), 60);
   SavedCustomBreakDuration := StrToIntDef(ReadINI(Username + ' Ironwood Antiban Manager', 'CustomBreakDuration', 'Configs/BAIronwoodSettings.ini'), 5);
@@ -1183,12 +1266,22 @@ begin
     Edit.SetOnKeyPress(@Edit.NumberField);
   end;
 
+  with Self.PreferPopulatedTreesCheckBox do
+  begin
+    Create(tab);
+    SetCaption('Prefer Trees With Players (Forestry)');
+    SetLeft(TControl.AdjustToDPI(40));
+    SetTop(Self.WorldHopIntervalInput.GetTop() + TControl.AdjustToDPI(45));
+    SetChecked(SavedPreferPopulatedTrees);
+    SetHint('Prefer chopping trees that other players are already at for forestry worlds.');
+  end;
+
   with Self.EnableWebhooksCheckBox do
   begin
     Create(tab);
     SetCaption('Enable Discord Notifications');
     SetLeft(TControl.AdjustToDPI(40));
-    SetTop(Self.WorldHopIntervalInput.GetTop() + TControl.AdjustToDPI(45));
+    SetTop(Self.PreferPopulatedTreesCheckBox.GetTop() + TControl.AdjustToDPI(30));
     SetChecked(SavedEnableWebhooks);
     CheckBox.SetOnChange(@Self.WebhooksCheckboxChanged);
   end;
